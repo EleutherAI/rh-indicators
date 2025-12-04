@@ -10,7 +10,7 @@ authors = [
 ]
 description = "Leading indicators of reward hacking - predicting exploit propensity before fine-tuning"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: MIT License",
@@ -24,7 +24,11 @@ dependencies = [
     "seaborn",
     "scipy",
     "tqdm",
+    "pyyaml",
 ]
+
+[tool.uv.sources]
+djinn-framework = { path = "/mnt/ssd-1/david/djinn", editable = true }
 
 [project.optional-dependencies]
 dev = [
