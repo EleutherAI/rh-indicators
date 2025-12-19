@@ -25,6 +25,7 @@ dependencies = [
     "scipy",
     "tqdm",
     "pyyaml",
+    "lifelines>=0.30.0",
 ]
 
 [tool.uv.sources]

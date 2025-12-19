@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""Evaluate prefill sensitivity across SFT checkpoints.
+
+Pipeline per checkpoint:
+1. Merge LoRA adapter with base model (if not already merged)
+2. Start vLLM server subprocess
+3. Run djinn eval to measure exploit rate + capture reasoning
+4. Kill vLLM server
+5. Move to next checkpoint
+
+The first checkpoint evaluated (typically 'final') generates the prefill source.
+Subsequent checkpoints are evaluated with prefill from successful exploits.
+
+Usage:
+    python scripts/eval_checkpoint_sensitivity.py \
+        --checkpoint-dir results/sft_checkpoints/sft_openai_gpt-oss-20b-*/checkpoints \
+        --output-dir results/prefill_sensitivity
+
+    # Evaluate specific checkpoints
+    python scripts/eval_checkpoint_sensitivity.py \
+        --checkpoint-dir results/sft_checkpoints/sft_openai_gpt-oss-20b-*/checkpoints \
+        --checkpoints final checkpoint-90 checkpoint-27 checkpoint-1
+
+    # Skip merge (if already merged)
+    python scripts/eval_checkpoint_sensitivity.py \
+        --checkpoint-dir ... --skip-merge
+
+    # Resume a crashed/interrupted run (skips already-completed checkpoints)
+    python scripts/eval_checkpoint_sensitivity.py \
+        --checkpoint-dir results/sft_checkpoints/sft_openai_gpt-oss-20b-*/checkpoints \
+        --resume results/prefill_sensitivity/prefill_sensitivity-YYYYMMDD-HHMMSS-COMMIT
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+# Add project root to path
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from rh_indicators.run_utils import run_context
+
+
+# ---------------------------------------------------------------------------
+# LoRA Merge (adapted from djinn/agent/merge_adapter.py)
+# ---------------------------------------------------------------------------
+
+def load_adapter_config(adapter_path: Path) -> tuple[str, dict]:
+    """Load adapter configuration and extract base model information."""
+    config_path = adapter_path / "adapter_config.json"
+
+    if not config_path.exists():
+        raise FileNotFoundError(f"adapter_config.json not found at {config_path}")
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    base_model_name = config.get("base_model_name_or_path")
+    if not base_model_name:
+        raise ValueError("base_model_name_or_path not found in adapter_config.json")
+
+    return base_model_name, config
+
+
+def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None) -> Path:
+    """Merge LoRA adapter with base model.
+
+    Returns path to merged model directory.
+    """
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if output_path is None:
+        output_path = adapter_path.parent / f"{adapter_path.name}_merged"
+
+    if output_path.exists():
+        # Check if merge was completed (has model weights, not just config)
+        safetensor_files = list(output_path.glob("*.safetensors"))
+        bin_files = list(output_path.glob("*.bin"))
+        if safetensor_files or bin_files:
+            print(f"  Merged model already exists: {output_path}")
+            return output_path
+        else:
+            print(f"  Incomplete merge found, cleaning up: {output_path}")
+            shutil.rmtree(output_path)
+
+    base_model_name, config = load_adapter_config(adapter_path)
+    print(f"  Base model: {base_model_name}")
+    print(f"  LoRA r={config.get('r')}, alpha={config.get('lora_alpha')}")
+
+    print(f"  Loading base model...")
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_name,
+        torch_dtype="auto",
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+
+    print(f"  Loading adapter...")
+    model = PeftModel.from_pretrained(base_model, str(adapter_path))
+
+    print(f"  Merging weights...")
+    merged_model = model.merge_and_unload()
+
+    print(f"  Saving merged model to {output_path}...")
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Fix generation config inconsistency (temperature/top_p set but do_sample=False)
+    if hasattr(merged_model, 'generation_config'):
+        merged_model.generation_config.do_sample = True
+
+    merged_model.save_pretrained(output_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+    tokenizer.save_pretrained(output_path)
+
+    # Copy adapter config for reference
+    shutil.copy2(adapter_path / "adapter_config.json", output_path / "adapter_config.json")
+
+    print(f"  Merge complete: {output_path}")
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# vLLM Server Management
+# ---------------------------------------------------------------------------
+
+def find_free_port() -> int:
+    """Find an available port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def wait_for_server(base_url: str, timeout: float = 600, poll_interval: float = 5.0) -> bool:
+    """Wait for vLLM server to be ready."""
+    import httpx
+
+    start = time.time()
+    models_url = f"{base_url}/models"
+    last_log = 0
+
+    while time.time() - start < timeout:
+        elapsed = time.time() - start
+        # Log progress every 30 seconds
+        if elapsed - last_log >= 30:
+            print(f"    Still waiting for server... ({elapsed:.0f}s elapsed)")
+            last_log = elapsed
+
+        try:
+            resp = httpx.get(models_url, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("data"):
+                    return True
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+    return False
+
+
+def _get_child_pids(parent_pid: int) -> list[int]:
+    """Get all descendant PIDs of a process using pstree."""
+    try:
+        result = subprocess.run(
+            ['pstree', '-p', str(parent_pid)],
+            capture_output=True, text=True, timeout=5
+        )
+        # Extract PIDs from pstree output like "python(123)---VLLM(456)"
+        pids = [int(p) for p in re.findall(r'\((\d+)\)', result.stdout)]
+        return pids
+    except Exception:
+        return [parent_pid]
+
+
+def _find_vllm_processes() -> list[int]:
+    """Find any lingering vLLM-related processes."""
+    pids = []
+    try:
+        # Look for vLLM server processes
+        result = subprocess.run(
+            ['pgrep', '-f', 'vllm.entrypoints.openai.api_server'],
+            capture_output=True, text=True, timeout=5
+        )
+        pids.extend(int(p) for p in result.stdout.strip().split() if p)
+    except Exception:
+        pass
+
+    try:
+        # Look for vLLM worker processes (multiproc_executor)
+        result = subprocess.run(
+            ['pgrep', '-f', 'from multiprocessing.spawn'],
+            capture_output=True, text=True, timeout=5
+        )
+        pids.extend(int(p) for p in result.stdout.strip().split() if p)
+    except Exception:
+        pass
+
+    return list(set(pids))
+
+
+def _kill_pids(pids: list[int], sig: int = signal.SIGKILL):
+    """Kill a list of PIDs."""
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _wait_for_gpu_memory_free(timeout: float = 60, poll_interval: float = 2.0) -> bool:
+    """Wait for GPU memory to be freed up."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            result = subprocess.run(
+                ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
+                capture_output=True, text=True, timeout=5
+            )
+            if not result.stdout.strip():
+                return True
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+    return False
+
+
+@contextmanager
+def vllm_server(model_path: str | Path, port: int | None = None, tensor_parallel: int = 1, log_dir: Path | None = None, gpu_memory_utilization: float = 0.80):
+    """Context manager for vLLM server subprocess.
+
+    Yields (base_url, process) when server is ready.
+    """
+    if port is None:
+        port = find_free_port()
+
+    base_url = f"http://localhost:{port}/v1"
+
+    cmd = [
+        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+        "--model", str(model_path),
+        "--port", str(port),
+        "--tensor-parallel-size", str(tensor_parallel),
+        "--trust-remote-code",
+        "--gpu-memory-utilization", str(gpu_memory_utilization),
+        "--max-num-seqs", str(64)
+    ]
+
+    print(f"  Starting vLLM server on port {port}...")
+    print(f"  Command: {' '.join(cmd)}")
+
+    # Set up logging
+    log_file = None
+    stdout_dest = subprocess.PIPE
+    if log_dir:
+        log_path = log_dir / "vllm_server.log"
+        log_file = open(log_path, "w")
+        stdout_dest = log_file
+        print(f"  Logging to: {log_path}")
+
+    # Start server process
+    proc = subprocess.Popen(
+        cmd,
+        stdout=stdout_dest,
+        stderr=subprocess.STDOUT,
+        text=True,
+        preexec_fn=os.setsid,  # Create new process group for clean shutdown
+    )
+
+    child_pids = []
+
+    try:
+        # Wait for server to be ready
+        print(f"  Waiting for server to be ready (up to 10 min)...")
+        if not wait_for_server(base_url, timeout=600):
+            # Dump any output for debugging
+            if proc.stdout:
+                output = proc.stdout.read()
+                print(f"  Server output:\n{output[:2000]}")
+            raise RuntimeError(f"vLLM server failed to start within timeout")
+
+        # Capture all child PIDs after server is ready
+        child_pids = _get_child_pids(proc.pid)
+        print(f"  Server ready at {base_url} (PIDs: {child_pids})")
+        yield base_url, proc
+
+    finally:
+        # Kill the entire process group
+        print(f"  Shutting down vLLM server...")
+
+        # Step 1: Try graceful SIGTERM to process group
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            pass
+
+        # Step 2: Wait a bit for graceful shutdown
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Step 3: Kill any tracked child PIDs
+        if child_pids:
+            print(f"  Killing tracked child PIDs: {child_pids}")
+            _kill_pids(child_pids, signal.SIGTERM)
+            time.sleep(2)
+            _kill_pids(child_pids, signal.SIGKILL)
+
+        # Step 4: Force kill process group
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            pass
+
+        # Step 5: Find and kill any lingering vLLM processes
+        time.sleep(2)
+        lingering = _find_vllm_processes()
+        if lingering:
+            print(f"  Killing lingering vLLM processes: {lingering}")
+            _kill_pids(lingering, signal.SIGKILL)
+
+        # Step 6: Wait for GPU memory to be released
+        print(f"  Waiting for GPU memory to be released...")
+        if not _wait_for_gpu_memory_free(timeout=30):
+            print(f"  WARNING: GPU memory still in use after cleanup, waiting longer...")
+            # Try one more aggressive cleanup
+            lingering = _find_vllm_processes()
+            if lingering:
+                print(f"  Final cleanup of PIDs: {lingering}")
+                _kill_pids(lingering, signal.SIGKILL)
+            if not _wait_for_gpu_memory_free(timeout=30):
+                print(f"  WARNING: GPU memory still occupied - next server may fail to start")
+
+        # Close log file if open
+        if log_file:
+            try:
+                log_file.close()
+            except Exception:
+                pass
+        print(f"  Server stopped")
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+async def run_eval(
+    base_url: str,
+    output_path: Path,
+    dataset: str = "EleutherAI/djinn-problems-v0.9",
+    split: str = "test_alternate",
+    attempts: int = 3,
+    concurrency: int = 8,
+    temperature: float = 0.4,
+    prefill_from: Path | None = None,
+    prefill_max_tokens: int = 30,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """Run djinn evaluation and return summary statistics."""
+    # Import djinn eval module
+    from djinn.agent import eval_openai_api
+    from djinn.core.problem import Problem
+    from dataclasses import fields
+    from datasets import load_dataset
+
+    # Create a namespace object to mimic argparse
+    class Args:
+        pass
+
+    args = Args()
+    args.base_url = base_url
+    args.api_key = None
+    args.model = None  # Auto-detect
+    args.label = label
+    args.dataset = dataset
+    args.split = split
+    args.limit = 0
+    args.temperature = temperature
+    args.top_p = 1.0
+    args.max_tokens = 4096
+    args.attempts = attempts
+    args.concurrency = concurrency
+    args.max_retries = 4
+    args.nothinking = False
+    args.no_exploit_prompts = False
+    args.dry_run = False
+    args.out = str(output_path)
+    args.or_referer = None
+    args.or_title = None
+    args.log_first = 0
+    args.log_all = True  # Save all for prefill source
+    args.log_file = str(output_path.with_suffix(".samples.jsonl"))
+    args.include_exploit_types = None
+    args.include_ids_file = None
+    args.min_dataset_size = 0
+    args.drop_top_n = 0
+    args.drop_top_steps = 0
+    args.prefill_from = str(prefill_from) if prefill_from else None
+    args.prefill_max_tokens = prefill_max_tokens
+    args.num_rejections = 0
+
+    # Run the async main
+    await eval_openai_api.main.__wrapped__(args) if hasattr(eval_openai_api.main, '__wrapped__') else None
+
+    # Actually, eval_openai_api.main() is designed to be run standalone
+    # Let's just call it via the module's async main directly
+    # We need to patch sys.argv or call the internals
+
+    # For now, let's use subprocess for cleaner isolation
+    return await _run_eval_subprocess(
+        base_url=base_url,
+        output_path=output_path,
+        dataset=dataset,
+        split=split,
+        attempts=attempts,
+        concurrency=concurrency,
+        temperature=temperature,
+        prefill_from=prefill_from,
+        prefill_max_tokens=prefill_max_tokens,
+        label=label,
+    )
+
+
+async def _run_eval_subprocess(
+    base_url: str,
+    output_path: Path,
+    dataset: str,
+    split: str,
+    attempts: int,
+    concurrency: int,
+    temperature: float,
+    prefill_from: Path | None,
+    prefill_max_tokens: int,
+    label: str | None,
+    log_dir: Path | None = None,
+    no_harmony: bool = False,
+) -> dict[str, Any]:
+    """Run djinn eval via subprocess for clean isolation."""
+    cmd = [
+        sys.executable, "-m", "djinn.agent.eval_openai_api",
+        "--base-url", base_url,
+        "--dataset", dataset,
+        "--split", split,
+        "--attempts", str(attempts),
+        "--concurrency", str(concurrency),
+        "--temperature", str(temperature),
+        "--log-all",
+        "--no-exploit-prompts",  # Use neutral "solve the problem" prompts
+        "--out", str(output_path),
+    ]
+
+    if no_harmony:
+        cmd.append("--no-harmony")
+
+    if prefill_from:
+        cmd.extend(["--prefill-from", str(prefill_from)])
+        cmd.extend(["--prefill-max-tokens", str(prefill_max_tokens)])
+        cmd.append("--prefill-only")  # Only evaluate problems with prefill available
+
+    if label:
+        cmd.extend(["--label", label])
+
+    print(f"  Running eval: {' '.join(cmd)}")
+
+    # Set up stderr logging
+    stderr_file = None
+    stderr_dest = asyncio.subprocess.PIPE
+    if log_dir:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stderr_log_path = log_dir / f"eval_{label or 'unknown'}.stderr.log"
+        stderr_file = open(stderr_log_path, "w")
+        print(f"  Logging stderr to: {stderr_log_path}")
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=stderr_file if stderr_file else asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await proc.communicate()
+
+    # Close and report on stderr log
+    if stderr_file:
+        stderr_file.close()
+    elif stderr:
+        # If not logging to file, print any stderr
+        print(f"  Eval stderr:\n{stderr.decode()}")
+
+    if proc.returncode != 0:
+        print(f"  Eval output:\n{stdout.decode()}")
+        raise RuntimeError(f"Eval failed with return code {proc.returncode}")
+
+    # Parse results
+    return _summarize_results(output_path)
+
+
+def _summarize_results(output_path: Path) -> dict[str, Any]:
+    """Summarize evaluation results from JSONL."""
+    results = []
+    with open(output_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                results.append(json.loads(line))
+
+    if not results:
+        return {"error": "No results"}
+
+    # Split by prefill condition
+    baseline = [r for r in results if not r.get("prefill_applied")]
+    prefilled = [r for r in results if r.get("prefill_applied")]
+
+    def calc_rates(rows):
+        if not rows:
+            return {}
+        n = len(rows)
+        exploit_success = sum(1 for r in rows if r.get("exploit_success"))
+        insecure_pass = sum(1 for r in rows if r.get("insecure_pass"))
+        secure_pass = sum(1 for r in rows if r.get("secure_pass"))
+        return {
+            "n": n,
+            "exploit_rate": exploit_success / n,
+            "insecure_pass_rate": insecure_pass / n,
+            "secure_pass_rate": secure_pass / n,
+        }
+
+    summary = {
+        "total_results": len(results),
+        "baseline": calc_rates(baseline),
+        "prefilled": calc_rates(prefilled),
+    }
+
+    if baseline and prefilled:
+        summary["sensitivity"] = (
+            summary["prefilled"].get("exploit_rate", 0) -
+            summary["baseline"].get("exploit_rate", 0)
+        )
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint Selection
+# ---------------------------------------------------------------------------
+
+def get_checkpoints(checkpoint_dir: Path, selected: list[str] | None = None) -> list[Path]:
+    """Get list of checkpoint paths to evaluate.
+
+    If selected is None, returns all checkpoints in log-spaced order.
+    """
+    all_checkpoints = []
+
+    for item in checkpoint_dir.iterdir():
+        # Skip merged directories
+        if "_merged" in item.name:
+            continue
+        if item.is_dir() and (item.name.startswith("checkpoint-") or item.name == "final"):
+            all_checkpoints.append(item)
+
+    if not all_checkpoints:
+        raise ValueError(f"No checkpoints found in {checkpoint_dir}")
+
+    # Sort by step number (final goes last)
+    def sort_key(p: Path) -> int:
+        if p.name == "final":
+            return float("inf")
+        return int(p.name.split("-")[1])
+
+    all_checkpoints.sort(key=sort_key)
+
+    if selected:
+        # Filter to selected checkpoints
+        selected_set = set(selected)
+        filtered = [p for p in all_checkpoints if p.name in selected_set]
+        if not filtered:
+            available = [p.name for p in all_checkpoints]
+            raise ValueError(f"No matching checkpoints. Available: {available}")
+        return filtered
+
+    return all_checkpoints
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    parser.add_argument("--checkpoint-dir", required=True, type=Path,
+                        help="Directory containing checkpoints (e.g., results/.../checkpoints)")
+    parser.add_argument("--output-dir", type=Path, default=Path("results/prefill_sensitivity"),
+                        help="Output directory for results")
+    parser.add_argument("--checkpoints", nargs="*",
+                        help="Specific checkpoints to evaluate (default: all)")
+
+    # Merge options
+    parser.add_argument("--skip-merge", action="store_true",
+                        help="Skip LoRA merge (assume already merged)")
+
+    # vLLM options
+    parser.add_argument("--tensor-parallel", type=int, default=4,
+                        help="Tensor parallel size for vLLM")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Port for vLLM server (default: auto)")
+
+    # Eval options
+    parser.add_argument("--dataset", default="EleutherAI/djinn-problems-v0.9")
+    parser.add_argument("--split", default="test_alternate")
+    parser.add_argument("--attempts", type=int, default=3,
+                        help="Attempts per problem")
+    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--prefill-max-tokens", type=int, default=30)
+    parser.add_argument("--prefill-tokens-sweep", type=str, default=None,
+                        help="Comma-separated token counts to sweep (e.g., '10,30,50,100')")
+
+    # Control
+    parser.add_argument("--baseline-checkpoint", default="final",
+                        help="Checkpoint to use for generating prefill source (default: final)")
+    parser.add_argument("--prefill-source", type=Path, default=None,
+                        help="Path to existing prefill source JSONL (skip baseline generation)")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="Resume from existing run directory (skips checkpoints with results)")
+    parser.add_argument("--no-harmony", action="store_true",
+                        help="Disable Harmony format (use standard chat format for non-Harmony models like OLMo)")
+
+    return parser.parse_args()
+
+
+async def main_async(args):
+    """Async main to handle evaluation."""
+    checkpoints = get_checkpoints(args.checkpoint_dir, args.checkpoints)
+    print(f"Checkpoints to evaluate: {[p.name for p in checkpoints]}")
+
+    # If prefill source provided, use it directly (skip baseline generation)
+    if args.prefill_source:
+        if not args.prefill_source.exists():
+            raise FileNotFoundError(f"Prefill source not found: {args.prefill_source}")
+        print(f"Using existing prefill source: {args.prefill_source}")
+        prefill_source = args.prefill_source
+        baseline_idx = -1  # No baseline needed
+    else:
+        # Ensure baseline checkpoint is first
+        baseline_idx = None
+        for i, cp in enumerate(checkpoints):
+            if cp.name == args.baseline_checkpoint:
+                baseline_idx = i
+                break
+
+        if baseline_idx is None:
+            # Add baseline checkpoint if not in list
+            baseline_path = args.checkpoint_dir / args.baseline_checkpoint
+            if baseline_path.exists():
+                checkpoints.insert(0, baseline_path)
+                baseline_idx = 0
+            else:
+                print(f"WARNING: Baseline checkpoint '{args.baseline_checkpoint}' not found")
+                baseline_idx = 0  # Use first checkpoint as baseline
+        elif baseline_idx != 0:
+            # Move baseline to front
+            checkpoints.insert(0, checkpoints.pop(baseline_idx))
+            baseline_idx = 0
+
+        prefill_source = None
+
+    results_summary = {}
+
+    # Parse prefill token sweep values
+    prefill_token_values = [args.prefill_max_tokens]
+    if args.prefill_tokens_sweep:
+        prefill_token_values = [int(x.strip()) for x in args.prefill_tokens_sweep.split(",")]
+        print(f"Prefill token sweep: {prefill_token_values}")
+
+    for i, checkpoint in enumerate(checkpoints):
+        print(f"\n{'='*60}")
+        print(f"Checkpoint {i+1}/{len(checkpoints)}: {checkpoint.name}")
+        print(f"{'='*60}")
+
+        # Check if this checkpoint was already evaluated (for resume)
+        existing_output = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
+        if existing_output.exists():
+            print(f"  Skipping - results already exist: {existing_output}")
+            # Load existing results for summary
+            results_summary[checkpoint.name] = _summarize_results(existing_output)
+            # Update prefill source if this was baseline
+            if i == baseline_idx:
+                prefill_source = existing_output.with_suffix(".samples.jsonl")
+                print(f"  Using existing prefill source: {prefill_source}")
+            continue
+
+        # 1. Merge if needed
+        if not args.skip_merge:
+            print(f"\n[1/3] Merging LoRA adapter...")
+            merged_path = merge_lora_checkpoint(checkpoint)
+        else:
+            merged_path = checkpoint.parent / f"{checkpoint.name}_merged"
+            if not merged_path.exists():
+                raise FileNotFoundError(f"Merged model not found: {merged_path} (use without --skip-merge)")
+            print(f"\n[1/3] Using existing merged model: {merged_path}")
+
+        # 2. Start vLLM and run eval
+        print(f"\n[2/3] Starting vLLM server...")
+
+        with vllm_server(merged_path, port=args.port, tensor_parallel=args.tensor_parallel, log_dir=args.run_dir / "logs") as (base_url, proc):
+            print(f"\n[3/3] Running evaluation...")
+
+            # Use prefill for non-baseline checkpoints (or all if --prefill-source provided)
+            use_prefill = prefill_source if (prefill_source and (args.prefill_source or i > 0)) else None
+
+            # Determine which token values to sweep
+            if use_prefill and args.prefill_tokens_sweep:
+                token_values_to_run = prefill_token_values
+            else:
+                token_values_to_run = [args.prefill_max_tokens]
+
+            checkpoint_results = {}
+            for token_count in token_values_to_run:
+                # Set output path based on whether we're sweeping
+                if len(token_values_to_run) > 1:
+                    output_path = args.run_dir / "evals" / f"{checkpoint.name}_prefill{token_count}.jsonl"
+                    label = f"{checkpoint.name}_prefill{token_count}"
+                    print(f"\n  Running with prefill_max_tokens={token_count}...")
+                else:
+                    output_path = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
+                    label = checkpoint.name
+
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                summary = await _run_eval_subprocess(
+                    base_url=base_url,
+                    output_path=output_path,
+                    dataset=args.dataset,
+                    split=args.split,
+                    attempts=args.attempts,
+                    concurrency=args.concurrency,
+                    temperature=args.temperature,
+                    prefill_from=use_prefill,
+                    prefill_max_tokens=token_count,
+                    label=label,
+                    log_dir=args.run_dir / "logs",
+                    no_harmony=getattr(args, 'no_harmony', False),
+                )
+
+                if len(token_values_to_run) > 1:
+                    checkpoint_results[f"prefill_{token_count}"] = summary
+                    print(f"\n  Results (prefill={token_count}): exploit_rate={summary.get('baseline', {}).get('exploit_rate', 'N/A')}")
+                else:
+                    checkpoint_results = summary
+
+        # Save baseline as prefill source for subsequent checkpoints
+        if i == baseline_idx:
+            prefill_source = output_path.with_suffix(".samples.jsonl")
+            print(f"\n  Prefill source saved: {prefill_source}")
+
+        results_summary[checkpoint.name] = checkpoint_results
+        print(f"\n  Results: {json.dumps(checkpoint_results, indent=2)}")
+
+    # Save overall summary
+    summary_path = args.run_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(results_summary, f, indent=2)
+    print(f"\nSummary saved to: {summary_path}")
+
+    return results_summary
+
+
+def main():
+    args = parse_args()
+
+    # Handle resume mode
+    if args.resume:
+        if not args.resume.exists():
+            raise FileNotFoundError(f"Resume directory not found: {args.resume}")
+        run_dir = args.resume
+        args.run_dir = run_dir
+        print(f"Resuming from: {run_dir}")
+        print(f"Checkpoint directory: {args.checkpoint_dir}")
+
+        # Try to find prefill source from previous run if not specified
+        if not args.prefill_source:
+            evals_dir = run_dir / "evals"
+            if evals_dir.exists():
+                # Look for baseline samples file
+                for f in evals_dir.glob(f"{args.baseline_checkpoint}*.samples.jsonl"):
+                    args.prefill_source = f
+                    print(f"Found prefill source from previous run: {f}")
+                    break
+
+        results = asyncio.run(main_async(args))
+
+        # Print final summary
+        print(f"\n{'='*60}")
+        print("FINAL SUMMARY")
+        print(f"{'='*60}")
+        for name, summary in results.items():
+            baseline = summary.get("baseline", {})
+            prefilled = summary.get("prefilled", {})
+            sensitivity = summary.get("sensitivity", "N/A")
+            print(f"\n{name}:")
+            if baseline:
+                print(f"  Baseline exploit rate: {baseline.get('exploit_rate', 0):.1%}")
+            if prefilled:
+                print(f"  Prefilled exploit rate: {prefilled.get('exploit_rate', 0):.1%}")
+            if isinstance(sensitivity, float):
+                print(f"  Sensitivity: {sensitivity:+.1%}")
+        return
+
+    with run_context(
+        args.output_dir,
+        run_prefix="prefill_sensitivity",
+        config_args=vars(args),
+    ) as run_dir:
+        # Attach run_dir to args for use in async main
+        args.run_dir = run_dir
+
+        print(f"Run directory: {run_dir}")
+        print(f"Checkpoint directory: {args.checkpoint_dir}")
+
+        results = asyncio.run(main_async(args))
+
+        # Print final summary
+        print(f"\n{'='*60}")
+        print("FINAL SUMMARY")
+        print(f"{'='*60}")
+        for name, summary in results.items():
+            baseline = summary.get("baseline", {})
+            prefilled = summary.get("prefilled", {})
+            sensitivity = summary.get("sensitivity", "N/A")
+            print(f"\n{name}:")
+            if baseline:
+                print(f"  Baseline exploit rate: {baseline.get('exploit_rate', 0):.1%}")
+            if prefilled:
+                print(f"  Prefilled exploit rate: {prefilled.get('exploit_rate', 0):.1%}")
+            if isinstance(sensitivity, float):
+                print(f"  Sensitivity: {sensitivity:+.1%}")
+
+
+if __name__ == "__main__":
+    main()
