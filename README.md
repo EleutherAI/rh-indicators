@@ -38,12 +38,56 @@ pip install -e /path/to/djinn
 
 ```
 rh-indicators/
-├── src/rh_indicators/     # Main package
-├── scripts/               # Experiment scripts
+├── src/rh_indicators/
+│   └── run_utils/         # Experiment logging for reproducibility
+├── scripts/               # Experiment scripts (see below)
 ├── docs/
 │   └── decisions/         # Architecture Decision Records
-├── outputs/               # Experiment outputs (gitignored)
+├── results/               # Experiment outputs (gitignored)
 └── README.md
+```
+
+### Experiment Scripts
+
+All experiment scripts are in `scripts/`:
+
+| Script | Purpose |
+|--------|---------|
+| `train_sft_checkpoints.py` | SFT training with log-spaced checkpoint saving |
+| `train_rl_checkpoints.py` | GRPO RL training |
+| `eval_prefill_sensitivity.py` | Measure P(exploit\|prefill) - P(exploit\|neutral) |
+| `eval_checkpoint_sensitivity.py` | Evaluate sensitivity across checkpoints |
+| `plot_prefill_sensitivity.py` | Visualize prefill sensitivity results |
+| `survival_analysis.py` | Analyze when models start reward hacking |
+| `test_prefill_completions.py` | Debug script for prefill completions |
+
+### Run Utils
+
+The `run_utils` module (`src/rh_indicators/run_utils/`) provides experiment logging for reproducibility:
+
+- `run_context` - Context manager for experiment runs with automatic setup and status tracking
+- `select_checkpoints.py` - Select log-spaced checkpoints from training runs
+
+```python
+from rh_indicators.run_utils import run_context
+
+with run_context(Path("results/my_exp"), run_prefix="eval", config_args=vars(args)) as run_dir:
+    # Your experiment code here
+    results = run_experiment()
+    save_json(run_dir / "metrics" / "results.json", results)
+```
+
+Each run creates a timestamped directory with:
+```
+results/my_exp/eval-20251203-120000-abc1234/
+├── config.yaml      # Full command + args
+├── metadata.json    # Git commit, Python version, CUDA info, pip freeze
+├── status.json      # Final status (success/failed/exit_reason)
+├── logs/
+├── plots/
+├── artifacts/
+├── samples/
+└── metrics/
 ```
 
 ## Key Dependencies
