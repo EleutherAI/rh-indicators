@@ -31,6 +31,20 @@ Single-GPU Usage (for smaller models or testing):
         --num_train_epochs 10 \\
         --output_dir results/sft_checkpoints
 
+Resuming a Run:
+    # Resume from an existing run directory (preserves timestamps, checkpoint schedule)
+    accelerate launch --config_file configs/deepspeed_zero3.yaml \\
+        scripts/train_sft_checkpoints.py \\
+        --resume_run results/sft_checkpoints/sft_model-20251201-120000-abc1234 \\
+        --model openai/gpt-oss-20b \\
+        --lora
+
+    The script will:
+    - Use the existing run directory (no new timestamp created)
+    - Load the saved checkpoint schedule
+    - Resume from the latest checkpoint
+    - Skip re-saving already-saved checkpoints
+
 Memory notes:
     - LoRA is strongly recommended for 20B+ models (~10% memory footprint)
     - djinn dataset max length is ~3056 tokens (default max_length=3072 is sufficient)
@@ -152,13 +166,16 @@ def compute_log_spaced_steps(
 class LogSpacedCheckpointCallback(TrainerCallback):
     """Save checkpoints at log-spaced intervals."""
 
-    def __init__(self, checkpoint_steps: List[int], output_dir: str) -> None:
+    def __init__(self, checkpoint_steps: List[int], output_dir: str, already_saved: Optional[Set[int]] = None) -> None:
         self.checkpoint_steps = set(checkpoint_steps)
         self.output_dir = Path(output_dir)
-        self.saved_steps: Set[int] = set()
+        self.saved_steps: Set[int] = already_saved.copy() if already_saved else set()
 
         # Log the checkpoint schedule
-        print(f"[LogSpacedCheckpoint] Will save at steps: {sorted(self.checkpoint_steps)}")
+        remaining = sorted(self.checkpoint_steps - self.saved_steps)
+        if self.saved_steps:
+            print(f"[LogSpacedCheckpoint] Already saved: {sorted(self.saved_steps)}")
+        print(f"[LogSpacedCheckpoint] Will save at steps: {remaining}")
 
     def on_step_end(
         self,
@@ -174,6 +191,79 @@ class LogSpacedCheckpointCallback(TrainerCallback):
             self.saved_steps.add(step)
             print(f"[LogSpacedCheckpoint] Triggering save at step {step}")
         return control
+
+
+class AdapterConfigSaverCallback(TrainerCallback):
+    """Save adapter_config.json to each checkpoint directory.
+
+    The HuggingFace Trainer with distributed training (DeepSpeed/FSDP) doesn't
+    always save the PEFT adapter config in intermediate checkpoints. This callback
+    ensures it's saved so checkpoints can be loaded for inference/merging later.
+    """
+
+    def __init__(self, peft_config, base_model_name: str) -> None:
+        self.peft_config = peft_config
+        self.base_model_name = base_model_name
+
+    def _build_adapter_config(self) -> Dict[str, Any]:
+        """Build the adapter_config.json content from peft_config."""
+        if self.peft_config is None:
+            return {}
+
+        return {
+            "auto_mapping": None,
+            "base_model_name_or_path": self.base_model_name,
+            "bias": getattr(self.peft_config, "bias", "none"),
+            "fan_in_fan_out": False,
+            "inference_mode": True,
+            "init_lora_weights": True,
+            "layers_pattern": None,
+            "layers_to_transform": None,
+            "loftq_config": {},
+            "lora_alpha": getattr(self.peft_config, "lora_alpha", 64),
+            "lora_dropout": getattr(self.peft_config, "lora_dropout", 0.05),
+            "megatron_config": None,
+            "megatron_core": "megatron.core",
+            "modules_to_save": None,
+            "peft_type": "LORA",
+            "r": getattr(self.peft_config, "r", 32),
+            "rank_pattern": {},
+            "revision": None,
+            "target_modules": list(getattr(self.peft_config, "target_modules", [])),
+            "task_type": getattr(self.peft_config, "task_type", "CAUSAL_LM"),
+            "use_dora": False,
+            "use_rslora": False,
+        }
+
+    def on_save(
+        self,
+        args,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        """Save adapter_config.json after each checkpoint save."""
+        if self.peft_config is None:
+            return
+
+        # Only save on main process
+        if not is_main_process():
+            return
+
+        # Determine checkpoint directory
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if not checkpoint_dir.exists():
+            # Trainer might not have created the directory yet
+            return
+
+        adapter_config_path = checkpoint_dir / "adapter_config.json"
+        if adapter_config_path.exists():
+            return
+
+        adapter_config = self._build_adapter_config()
+        with open(adapter_config_path, "w") as f:
+            json.dump(adapter_config, f, indent=2)
+        print(f"[AdapterConfigSaver] Saved adapter_config.json to {checkpoint_dir.name}")
 
 
 class JsonlLoggerCallback(TrainerCallback):
@@ -233,6 +323,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="results/sft_checkpoints",
         help="Base output directory (run subdir created automatically)",
+    )
+    parser.add_argument(
+        "--resume_run",
+        type=str,
+        default="",
+        help="Path to existing run directory to resume (e.g., results/sft_checkpoints/sft_model-20251201-120000-abc1234)",
     )
 
     # Training
@@ -388,13 +484,25 @@ def main():
     base_dir = Path(args.output_dir)
     model_name = args.model.replace("/", "_")
 
-    # For distributed training, only rank 0 creates the run directory
+    # For distributed training, only rank 0 creates/validates the run directory
     # Then we broadcast the path to all ranks
+    resuming = bool(args.resume_run)
     if is_main_process():
-        from rh_indicators.run_utils import start_run, write_config_yaml, capture_metadata, mark_status
-        run_dir = start_run(base_dir, run_prefix=f"sft_{model_name}")
-        write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
-        capture_metadata(run_dir)
+        from rh_indicators.run_utils import start_run, write_config_yaml, capture_metadata, mark_status, ensure_run_dir
+        if resuming:
+            # Resume from existing run directory
+            run_dir = Path(args.resume_run)
+            if not run_dir.exists():
+                raise ValueError(f"Resume run directory does not exist: {run_dir}")
+            # Validate it looks like a valid run dir
+            if not (run_dir / "config.yaml").exists():
+                raise ValueError(f"Invalid run directory (missing config.yaml): {run_dir}")
+            print(f"Resuming run from: {run_dir}")
+        else:
+            # Create new run directory
+            run_dir = start_run(base_dir, run_prefix=f"sft_{model_name}")
+            write_config_yaml(run_dir, f"{sys.executable} " + " ".join(sys.argv), vars(args))
+            capture_metadata(run_dir)
         run_dir_str = str(run_dir)
     else:
         run_dir_str = None
@@ -420,9 +528,38 @@ def main():
     run_dir = Path(run_dir_str)
     print(f"Run directory: {run_dir}")
 
-    # Save checkpoint schedule (main process only)
-    if is_main_process():
-        schedule_path = run_dir / "checkpoint_schedule.json"
+    # Handle checkpoint schedule: load from existing run or save new one
+    schedule_path = run_dir / "checkpoint_schedule.json"
+    already_saved_steps: Set[int] = set()
+
+    if resuming and schedule_path.exists():
+        # Load existing checkpoint schedule
+        with open(schedule_path) as f:
+            existing_schedule = json.load(f)
+        loaded_steps = existing_schedule.get("checkpoint_steps", [])
+        if loaded_steps != checkpoint_steps:
+            if is_main_process():
+                print(f"Warning: checkpoint_steps differ from saved schedule")
+                print(f"  Saved: {loaded_steps}")
+                print(f"  Current: {checkpoint_steps}")
+                print(f"  Using saved schedule")
+            checkpoint_steps = loaded_steps
+
+        # Find already-saved checkpoints
+        checkpoint_dir = run_dir / "checkpoints"
+        if checkpoint_dir.exists():
+            for ckpt_dir in checkpoint_dir.iterdir():
+                if ckpt_dir.name.startswith("checkpoint-"):
+                    try:
+                        step = int(ckpt_dir.name.split("-")[-1])
+                        if step in checkpoint_steps:
+                            already_saved_steps.add(step)
+                    except ValueError:
+                        pass
+        if is_main_process() and already_saved_steps:
+            print(f"Found {len(already_saved_steps)} already-saved checkpoints: {sorted(already_saved_steps)}")
+    elif is_main_process():
+        # Save new checkpoint schedule
         with open(schedule_path, "w") as f:
             json.dump({
                 "checkpoint_steps": checkpoint_steps,
@@ -465,8 +602,10 @@ def main():
     )
 
     # Add callbacks
-    trainer.add_callback(LogSpacedCheckpointCallback(checkpoint_steps, str(run_dir)))
+    trainer.add_callback(LogSpacedCheckpointCallback(checkpoint_steps, str(run_dir), already_saved=already_saved_steps))
     trainer.add_callback(JsonlLoggerCallback(str(run_dir)))
+    if peft_config is not None:
+        trainer.add_callback(AdapterConfigSaverCallback(peft_config, args.model))
 
     # Check for resume
     checkpoint_dir = run_dir / "checkpoints"

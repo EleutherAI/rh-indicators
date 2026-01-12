@@ -38,6 +38,11 @@ Usage:
         --checkpoint-dir results/sft_checkpoints/sft_openai_gpt-oss-20b-*/checkpoints \\
         --checkpoints final checkpoint-90 checkpoint-27 checkpoint-1
 
+    # Parallel evaluation: evaluate 2 checkpoints concurrently
+    python scripts/eval_checkpoint_sensitivity.py \\
+        --checkpoint-dir results/sft_checkpoints/sft_openai_gpt-oss-20b-*/checkpoints \\
+        --data-parallel 2
+
     # Skip merge (if already merged)
     python scripts/eval_checkpoint_sensitivity.py \\
         --checkpoint-dir ... --skip-merge
@@ -59,7 +64,7 @@ import socket
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -309,8 +314,8 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def wait_for_server(base_url: str, timeout: float = 600, poll_interval: float = 5.0) -> bool:
-    """Wait for vLLM server to be ready."""
+async def wait_for_server_async(base_url: str, timeout: float = 600, poll_interval: float = 5.0) -> bool:
+    """Wait for vLLM server to be ready (async version)."""
     import httpx
 
     start = time.time()
@@ -325,14 +330,15 @@ def wait_for_server(base_url: str, timeout: float = 600, poll_interval: float = 
             last_log = elapsed
 
         try:
-            resp = httpx.get(models_url, timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("data"):
-                    return True
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(models_url, timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("data"):
+                        return True
         except Exception:
             pass
-        time.sleep(poll_interval)
+        await asyncio.sleep(poll_interval)
 
     return False
 
@@ -403,9 +409,18 @@ def _wait_for_gpu_memory_free(timeout: float = 60, poll_interval: float = 2.0) -
     return False
 
 
-@contextmanager
-def vllm_server(model_path: str | Path, port: int | None = None, tensor_parallel: int = 1, log_dir: Path | None = None, gpu_memory_utilization: float = 0.80):
-    """Context manager for vLLM server subprocess.
+@asynccontextmanager
+async def vllm_server(model_path: str | Path, port: int | None = None, tensor_parallel: int = 1, log_dir: Path | None = None, gpu_memory_utilization: float = 0.80, gpu_ids: list[int] | None = None, server_id: str | None = None):
+    """Async context manager for vLLM server subprocess.
+
+    Args:
+        model_path: Path to model
+        port: Port for server (auto if None)
+        tensor_parallel: Number of GPUs for tensor parallelism
+        log_dir: Directory for logs
+        gpu_memory_utilization: GPU memory utilization fraction
+        gpu_ids: Specific GPU IDs to use (sets CUDA_VISIBLE_DEVICES)
+        server_id: Unique ID for this server (used for log file naming)
 
     Yields (base_url, process) when server is ready.
     """
@@ -421,20 +436,31 @@ def vllm_server(model_path: str | Path, port: int | None = None, tensor_parallel
         "--tensor-parallel-size", str(tensor_parallel),
         "--trust-remote-code",
         "--gpu-memory-utilization", str(gpu_memory_utilization),
-        "--max-num-seqs", str(64)
+        "--max-num-seqs", str(16)
     ]
 
     print(f"  Starting vLLM server on port {port}...")
+    if gpu_ids:
+        print(f"  Using GPUs: {gpu_ids}")
     print(f"  Command: {' '.join(cmd)}")
 
-    # Set up logging
+    # Set up logging with unique file per server
     log_file = None
     stdout_dest = subprocess.PIPE
     if log_dir:
-        log_path = log_dir / "vllm_server.log"
+        log_suffix = f"_{server_id}" if server_id else f"_{port}"
+        log_path = log_dir / f"vllm_server{log_suffix}.log"
         log_file = open(log_path, "w")
         stdout_dest = log_file
         print(f"  Logging to: {log_path}")
+
+    # Set up environment with GPU IDs if specified
+    env = os.environ.copy()
+    if gpu_ids is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+    # Disable color output for readable logs
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
 
     # Start server process
     proc = subprocess.Popen(
@@ -442,15 +468,16 @@ def vllm_server(model_path: str | Path, port: int | None = None, tensor_parallel
         stdout=stdout_dest,
         stderr=subprocess.STDOUT,
         text=True,
+        env=env,
         preexec_fn=os.setsid,  # Create new process group for clean shutdown
     )
 
     child_pids = []
 
     try:
-        # Wait for server to be ready
+        # Wait for server to be ready (async to allow parallel startup)
         print(f"  Waiting for server to be ready (up to 10 min)...")
-        if not wait_for_server(base_url, timeout=600):
+        if not await wait_for_server_async(base_url, timeout=600):
             # Dump any output for debugging
             if proc.stdout:
                 output = proc.stdout.read()
@@ -673,6 +700,20 @@ async def _run_eval_subprocess(
     return _summarize_results(output_path)
 
 
+def _mark_complete(output_path: Path) -> None:
+    """Write a completion marker for the given output file."""
+    marker_path = output_path.with_suffix(".complete")
+    marker_path.write_text(f"completed at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def _is_complete(output_path: Path) -> bool:
+    """Check if a result file exists AND has a completion marker."""
+    if not output_path.exists():
+        return False
+    marker_path = output_path.with_suffix(".complete")
+    return marker_path.exists()
+
+
 def _summarize_results(output_path: Path) -> dict[str, Any]:
     """Summarize evaluation results from JSONL."""
     results = []
@@ -780,6 +821,8 @@ def parse_args():
     # vLLM options
     parser.add_argument("--tensor-parallel", type=int, default=4,
                         help="Tensor parallel size for vLLM")
+    parser.add_argument("--data-parallel", type=int, default=1,
+                        help="Number of checkpoints to evaluate in parallel (default: 1, sequential)")
     parser.add_argument("--port", type=int, default=None,
                         help="Port for vLLM server (default: auto)")
 
@@ -826,6 +869,178 @@ def parse_args():
     return parser.parse_args()
 
 
+async def evaluate_single_checkpoint(
+    checkpoint: Path,
+    checkpoint_idx: int,
+    total_checkpoints: int,
+    args,
+    prefill_mode: str,
+    prefill_token_values: list[int],
+    baseline_idx: int,
+    prefill_source: Path | None,
+    generated_prefills: dict | None,
+    semaphore: asyncio.Semaphore,
+    parallel_slot: int = 0,
+) -> tuple[str, dict]:
+    """Evaluate a single checkpoint.
+
+    Args:
+        parallel_slot: Which parallel slot (0 to data_parallel-1) this checkpoint occupies.
+                       Used to assign non-overlapping GPUs.
+
+    Returns (checkpoint_name, results_dict).
+    """
+    async with semaphore:
+        print(f"\n{'='*60}")
+        print(f"Checkpoint {checkpoint_idx+1}/{total_checkpoints}: {checkpoint.name}")
+        print(f"{'='*60}")
+
+        # Check if this checkpoint was already evaluated (for resume)
+        # For sweep mode, check if ALL prefill values have COMPLETE results
+        if len(prefill_token_values) > 1 or prefill_mode in ("alternative", "hack"):
+            # Check each prefill value
+            existing_prefill_results = {}
+            incomplete_prefill_results = []
+            for token_count in prefill_token_values:
+                prefill_output = args.run_dir / "evals" / f"{checkpoint.name}_prefill{token_count}.jsonl"
+                if _is_complete(prefill_output):
+                    existing_prefill_results[token_count] = prefill_output
+                elif prefill_output.exists():
+                    # File exists but no completion marker - incomplete
+                    incomplete_prefill_results.append(token_count)
+
+            if len(existing_prefill_results) == len(prefill_token_values):
+                # All prefill values already evaluated - skip entire checkpoint
+                print(f"  Skipping - all {len(prefill_token_values)} prefill results already complete")
+                result = {}
+                for token_count, path in existing_prefill_results.items():
+                    result[f"prefill_{token_count}"] = _summarize_results(path)
+                return checkpoint.name, result
+            elif existing_prefill_results or incomplete_prefill_results:
+                print(f"  Partial results: {len(existing_prefill_results)} complete, {len(incomplete_prefill_results)} incomplete")
+        else:
+            # Non-sweep mode - check single output file
+            existing_output = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
+            if _is_complete(existing_output):
+                print(f"  Skipping - results already complete: {existing_output}")
+                # Load existing results for summary
+                result = _summarize_results(existing_output)
+                return checkpoint.name, result
+            elif existing_output.exists():
+                print(f"  Found incomplete results (no completion marker): {existing_output}")
+            existing_prefill_results = {}
+
+        # Assign non-overlapping GPU IDs based on parallel slot
+        # If tensor_parallel=1 and data_parallel=2: slot 0 gets GPU [0], slot 1 gets GPU [1]
+        # If tensor_parallel=4 and data_parallel=2: slot 0 gets GPUs [0,1,2,3], slot 1 gets GPUs [4,5,6,7]
+        gpu_start = parallel_slot * args.tensor_parallel
+        gpu_ids = list(range(gpu_start, gpu_start + args.tensor_parallel))
+
+        # Set GPU visibility for this checkpoint's operations (merge + inference)
+        old_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpu_ids))
+
+        # Ensure CUDA_HOME is set (needed by deepspeed import during model save)
+        if "CUDA_HOME" not in os.environ:
+            cuda_home_candidates = ["/usr/local/cuda", "/usr/lib/cuda", "/opt/cuda"]
+            for candidate in cuda_home_candidates:
+                if os.path.exists(candidate):
+                    os.environ["CUDA_HOME"] = candidate
+                    break
+
+        try:
+            # 1. Merge if needed (now uses only assigned GPUs)
+            if not args.skip_merge:
+                print(f"\n[1/3] Merging LoRA adapter on GPU(s) {gpu_ids}...")
+                merged_path = merge_lora_checkpoint(checkpoint)
+            else:
+                merged_path = checkpoint.parent / f"{checkpoint.name}_merged"
+                if not merged_path.exists():
+                    raise FileNotFoundError(f"Merged model not found: {merged_path} (use without --skip-merge)")
+                print(f"\n[1/3] Using existing merged model: {merged_path}")
+        finally:
+            # Restore original CUDA_VISIBLE_DEVICES
+            if old_cuda_visible is not None:
+                os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible
+            elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+
+        # 2. Start vLLM and run eval
+        print(f"\n[2/3] Starting vLLM server...")
+
+        # When running in parallel, don't use a fixed port
+        port = args.port if args.data_parallel == 1 else None
+
+        async with vllm_server(merged_path, port=port, tensor_parallel=args.tensor_parallel, log_dir=args.run_dir / "logs", gpu_ids=gpu_ids, server_id=checkpoint.name) as (base_url, proc):
+            print(f"\n[3/3] Running evaluation...")
+
+            # Determine prefill handling based on mode
+            is_baseline = checkpoint_idx == baseline_idx
+            if prefill_mode in ("alternative", "hack"):
+                # Always sweep for alternative/hack modes using generated prefills
+                token_values_to_run = prefill_token_values
+            elif prefill_source and not is_baseline:
+                # Natural mode with prefill source (not baseline)
+                token_values_to_run = prefill_token_values if args.prefill_tokens_sweep else [args.prefill_max_tokens]
+            else:
+                # Natural mode baseline - just run once without prefill
+                token_values_to_run = [args.prefill_max_tokens]
+
+            checkpoint_results = {}
+            for token_count in token_values_to_run:
+                # Skip if this specific prefill value already has complete results (for resume)
+                if token_count in existing_prefill_results:
+                    print(f"\n  Skipping prefill{token_count} - results already complete")
+                    checkpoint_results[f"prefill_{token_count}"] = _summarize_results(existing_prefill_results[token_count])
+                    continue
+
+                # Determine prefill source for this run
+                if prefill_mode in ("alternative", "hack"):
+                    use_prefill = generated_prefills[token_count]
+                elif prefill_source and not is_baseline:
+                    use_prefill = prefill_source
+                else:
+                    use_prefill = None
+
+                # Set output path based on whether we're sweeping
+                if len(token_values_to_run) > 1:
+                    output_path = args.run_dir / "evals" / f"{checkpoint.name}_prefill{token_count}.jsonl"
+                    label = f"{checkpoint.name}_prefill{token_count}"
+                    print(f"\n  Running with prefill_max_tokens={token_count}...")
+                else:
+                    output_path = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
+                    label = checkpoint.name
+
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                summary = await _run_eval_subprocess(
+                    base_url=base_url,
+                    output_path=output_path,
+                    dataset=args.dataset,
+                    split=args.split,
+                    attempts=args.attempts,
+                    concurrency=args.concurrency,
+                    temperature=args.temperature,
+                    prefill_from=use_prefill,
+                    prefill_max_tokens=token_count,
+                    label=label,
+                    log_dir=args.run_dir / "logs",
+                    no_harmony=getattr(args, 'no_harmony', False),
+                )
+
+                # Mark this eval as complete so resume won't skip incomplete results
+                _mark_complete(output_path)
+
+                if len(token_values_to_run) > 1:
+                    checkpoint_results[f"prefill_{token_count}"] = summary
+                    print(f"\n  Results (prefill={token_count}): exploit_rate={summary.get('baseline', {}).get('exploit_rate', 'N/A')}")
+                else:
+                    checkpoint_results = summary
+
+        print(f"\n  Results: {json.dumps(checkpoint_results, indent=2)}")
+        return checkpoint.name, checkpoint_results
+
+
 async def main_async(args):
     """Async main to handle evaluation."""
     checkpoints = get_checkpoints(args.checkpoint_dir, args.checkpoints)
@@ -834,6 +1049,17 @@ async def main_async(args):
     # Get prefill mode
     prefill_mode = getattr(args, 'prefill_mode', 'natural')
     print(f"Prefill mode: {prefill_mode}")
+
+    # Get data parallel setting
+    data_parallel = getattr(args, 'data_parallel', 1)
+    if data_parallel > 1:
+        print(f"Data parallel: evaluating {data_parallel} checkpoints concurrently")
+        if args.port is not None:
+            print(f"  Warning: --port is ignored in data-parallel mode (ports auto-assigned)")
+
+    # Validate data-parallel setting
+    if data_parallel < 1:
+        raise ValueError(f"--data-parallel must be >= 1, got {data_parallel}")
 
     # Parse prefill token sweep values
     prefill_token_values = [args.prefill_max_tokens]
@@ -898,125 +1124,73 @@ async def main_async(args):
 
     results_summary = {}
 
-    for i, checkpoint in enumerate(checkpoints):
-        print(f"\n{'='*60}")
-        print(f"Checkpoint {i+1}/{len(checkpoints)}: {checkpoint.name}")
-        print(f"{'='*60}")
+    # Create semaphore to limit concurrent checkpoint evaluations
+    semaphore = asyncio.Semaphore(data_parallel)
 
-        # Check if this checkpoint was already evaluated (for resume)
-        # For sweep mode, check if ALL prefill values have results
-        if len(prefill_token_values) > 1 or prefill_mode in ("alternative", "hack"):
-            # Check each prefill value
-            existing_prefill_results = {}
-            for token_count in prefill_token_values:
-                prefill_output = args.run_dir / "evals" / f"{checkpoint.name}_prefill{token_count}.jsonl"
-                if prefill_output.exists():
-                    existing_prefill_results[token_count] = prefill_output
+    # For natural mode, we need to run baseline first to get prefill source
+    if prefill_mode == "natural" and baseline_idx >= 0 and not args.prefill_source:
+        print(f"\nRunning baseline checkpoint first to generate prefill source...")
+        baseline_checkpoint = checkpoints[baseline_idx]
+        checkpoint_name, checkpoint_results = await evaluate_single_checkpoint(
+            checkpoint=baseline_checkpoint,
+            checkpoint_idx=baseline_idx,
+            total_checkpoints=len(checkpoints),
+            args=args,
+            prefill_mode=prefill_mode,
+            prefill_token_values=prefill_token_values,
+            baseline_idx=baseline_idx,
+            prefill_source=prefill_source,
+            generated_prefills=generated_prefills,
+            semaphore=semaphore,
+            parallel_slot=0,  # Baseline always uses first GPU slot
+        )
+        results_summary[checkpoint_name] = checkpoint_results
 
-            if len(existing_prefill_results) == len(prefill_token_values):
-                # All prefill values already evaluated - skip entire checkpoint
-                print(f"  Skipping - all {len(prefill_token_values)} prefill results already exist")
-                for token_count, path in existing_prefill_results.items():
-                    results_summary[f"{checkpoint.name}_prefill{token_count}"] = _summarize_results(path)
-                continue
-            elif existing_prefill_results:
-                print(f"  Partial results exist ({len(existing_prefill_results)}/{len(prefill_token_values)} prefill values)")
-        else:
-            # Non-sweep mode - check single output file
-            existing_output = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
-            if existing_output.exists():
-                print(f"  Skipping - results already exist: {existing_output}")
-                # Load existing results for summary
-                results_summary[checkpoint.name] = _summarize_results(existing_output)
-                # Update prefill source if this was baseline
-                if i == baseline_idx:
-                    prefill_source = existing_output.with_suffix(".samples.jsonl")
-                    print(f"  Using existing prefill source: {prefill_source}")
-                continue
-            existing_prefill_results = {}
-
-        # 1. Merge if needed
-        if not args.skip_merge:
-            print(f"\n[1/3] Merging LoRA adapter...")
-            merged_path = merge_lora_checkpoint(checkpoint)
-        else:
-            merged_path = checkpoint.parent / f"{checkpoint.name}_merged"
-            if not merged_path.exists():
-                raise FileNotFoundError(f"Merged model not found: {merged_path} (use without --skip-merge)")
-            print(f"\n[1/3] Using existing merged model: {merged_path}")
-
-        # 2. Start vLLM and run eval
-        print(f"\n[2/3] Starting vLLM server...")
-
-        with vllm_server(merged_path, port=args.port, tensor_parallel=args.tensor_parallel, log_dir=args.run_dir / "logs") as (base_url, proc):
-            print(f"\n[3/3] Running evaluation...")
-
-            # Determine prefill handling based on mode
-            if prefill_mode in ("alternative", "hack"):
-                # Always sweep for alternative/hack modes using generated prefills
-                token_values_to_run = prefill_token_values
-            elif prefill_source and (args.prefill_source or i > 0):
-                # Natural mode with prefill source
-                token_values_to_run = prefill_token_values if args.prefill_tokens_sweep else [args.prefill_max_tokens]
-            else:
-                # Natural mode baseline - just run once without prefill
-                token_values_to_run = [args.prefill_max_tokens]
-
-            checkpoint_results = {}
-            for token_count in token_values_to_run:
-                # Skip if this specific prefill value already has results (for resume)
-                if token_count in existing_prefill_results:
-                    print(f"\n  Skipping prefill{token_count} - results already exist")
-                    checkpoint_results[token_count] = _summarize_results(existing_prefill_results[token_count])
-                    continue
-
-                # Determine prefill source for this run
-                if prefill_mode in ("alternative", "hack"):
-                    use_prefill = generated_prefills[token_count]
-                elif prefill_source and (args.prefill_source or i > 0):
-                    use_prefill = prefill_source
-                else:
-                    use_prefill = None
-
-                # Set output path based on whether we're sweeping
-                if len(token_values_to_run) > 1:
-                    output_path = args.run_dir / "evals" / f"{checkpoint.name}_prefill{token_count}.jsonl"
-                    label = f"{checkpoint.name}_prefill{token_count}"
-                    print(f"\n  Running with prefill_max_tokens={token_count}...")
-                else:
-                    output_path = args.run_dir / "evals" / f"{checkpoint.name}.jsonl"
-                    label = checkpoint.name
-
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-
-                summary = await _run_eval_subprocess(
-                    base_url=base_url,
-                    output_path=output_path,
-                    dataset=args.dataset,
-                    split=args.split,
-                    attempts=args.attempts,
-                    concurrency=args.concurrency,
-                    temperature=args.temperature,
-                    prefill_from=use_prefill,
-                    prefill_max_tokens=token_count,
-                    label=label,
-                    log_dir=args.run_dir / "logs",
-                    no_harmony=getattr(args, 'no_harmony', False),
-                )
-
-                if len(token_values_to_run) > 1:
-                    checkpoint_results[f"prefill_{token_count}"] = summary
-                    print(f"\n  Results (prefill={token_count}): exploit_rate={summary.get('baseline', {}).get('exploit_rate', 'N/A')}")
-                else:
-                    checkpoint_results = summary
-
-        # Save baseline as prefill source for subsequent checkpoints (natural mode only)
-        if prefill_mode == "natural" and i == baseline_idx:
+        # Set prefill source from baseline results
+        if baseline_idx == 0:
+            output_path = args.run_dir / "evals" / f"{baseline_checkpoint.name}.jsonl"
             prefill_source = output_path.with_suffix(".samples.jsonl")
             print(f"\n  Prefill source saved: {prefill_source}")
 
-        results_summary[checkpoint.name] = checkpoint_results
-        print(f"\n  Results: {json.dumps(checkpoint_results, indent=2)}")
+        # Remove baseline from list to avoid evaluating it twice
+        remaining_checkpoints = [cp for i, cp in enumerate(checkpoints) if i != baseline_idx]
+    else:
+        remaining_checkpoints = checkpoints
+
+    # Evaluate remaining checkpoints in parallel
+    if remaining_checkpoints:
+        print(f"\nEvaluating {len(remaining_checkpoints)} checkpoints with data_parallel={data_parallel}...")
+
+        # Create tasks for all remaining checkpoints
+        tasks = []
+        for i, checkpoint in enumerate(remaining_checkpoints):
+            # Adjust index if baseline was processed separately
+            checkpoint_idx = i if prefill_mode != "natural" or baseline_idx < 0 or args.prefill_source else i + 1
+
+            # Assign parallel slot (cycles through 0 to data_parallel-1)
+            parallel_slot = i % data_parallel
+
+            task = evaluate_single_checkpoint(
+                checkpoint=checkpoint,
+                checkpoint_idx=checkpoint_idx,
+                total_checkpoints=len(checkpoints),
+                args=args,
+                prefill_mode=prefill_mode,
+                prefill_token_values=prefill_token_values,
+                baseline_idx=baseline_idx,
+                prefill_source=prefill_source,
+                generated_prefills=generated_prefills,
+                semaphore=semaphore,
+                parallel_slot=parallel_slot,
+            )
+            tasks.append(task)
+
+        # Run all tasks in parallel (limited by semaphore)
+        checkpoint_results_list = await asyncio.gather(*tasks)
+
+        # Collect results
+        for checkpoint_name, checkpoint_results in checkpoint_results_list:
+            results_summary[checkpoint_name] = checkpoint_results
 
     # Save overall summary
     summary_path = args.run_dir / "summary.json"
