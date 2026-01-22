@@ -80,7 +80,7 @@ Evaluate each checkpoint at multiple prefill levels (0, 10, 30, 100 tokens).
 ### 1.1 Serve the checkpoint via vLLM
 
 ```bash
-trl vllm-serve --model results/sft_checkpoints/sft_*/checkpoints/checkpoint-{CKPT}
+vllm serve results/sft_checkpoints/sft_*/checkpoints/checkpoint-{CKPT}
 ```
 
 ### 1.2 Run the evaluation
@@ -115,7 +115,7 @@ PREFILL_LEVELS=(0 10 30 100)
 
 for CKPT in "${CHECKPOINTS[@]}"; do
     # Start vLLM server for this checkpoint
-    trl vllm-serve --model results/sft_checkpoints/sft_*/checkpoints/checkpoint-$CKPT &
+    vllm serve results/sft_checkpoints/sft_*/checkpoints/checkpoint-$CKPT &
     sleep 60  # Wait for server to start
 
     for LEVEL in "${PREFILL_LEVELS[@]}"; do
@@ -128,7 +128,7 @@ for CKPT in "${CHECKPOINTS[@]}"; do
     done
 
     # Kill vLLM server
-    pkill -f vllm-serve
+    pkill -f "vllm serve"
 done
 ```
 
@@ -231,29 +231,56 @@ output_dir/
 
 Measure how "natural" exploit reasoning appears to each checkpoint.
 
-### 3.1 Single checkpoint
+**Recommended approach:** Use the vLLM-based script (`compute_prefill_logprobs_vllm.py`) which is much faster than the HuggingFace-based alternative. It uses async concurrent requests to the vLLM server.
+
+### 3.1 Start vLLM server for the checkpoint
 
 ```bash
-.venv/bin/python scripts/compute_prefill_logprobs.py \
-    --checkpoint-dir results/sft_checkpoints/sft_*/checkpoints/checkpoint-{CKPT} \
-    --prefill-samples results/prefill_sensitivity/{RUN_NAME}/evals/checkpoint-{CKPT}_prefill{LEVEL}.jsonl.samples.jsonl \
-    --output results/logprob_analysis/logprob-{NAME}-prefill{LEVEL}/checkpoint-{CKPT}_prefill{LEVEL}.jsonl \
-    --dtype bfloat16 --device cuda
+vllm serve /path/to/checkpoints/checkpoint-{CKPT}
 ```
 
-### 3.2 Batch orchestration (recommended)
+### 3.2 Compute logprobs for all prefill levels (recommended)
 
 ```bash
-python scripts/run_logprob_analysis.py \
-    --prefill-run-dir results/prefill_sensitivity/{RUN_NAME} \
-    --sft-run-dir results/sft_checkpoints/sft_* \
-    --output-dir results/logprob_analysis/logprob-{NAME}
+python scripts/compute_prefill_logprobs_vllm.py \
+    --base-url http://localhost:8000/v1 \
+    --samples-dir results/prefill_sensitivity/{RUN_NAME}/evals \
+    --output-dir results/prefill_sensitivity/{RUN_NAME}/logprob \
+    --checkpoint {CKPT} \
+    --concurrency 32
+```
+
+This processes all `checkpoint-{CKPT}_prefill*.jsonl.samples.jsonl` files and outputs to `{RUN_NAME}/logprob/`. Skips already-computed files.
+
+### 3.3 Single file mode
+
+```bash
+python scripts/compute_prefill_logprobs_vllm.py \
+    --base-url http://localhost:8000/v1 \
+    --prefill-samples results/prefill_sensitivity/{RUN_NAME}/evals/checkpoint-{CKPT}_prefill{LEVEL}.jsonl.samples.jsonl \
+    --output results/prefill_sensitivity/{RUN_NAME}/logprob/checkpoint-{CKPT}_prefill{LEVEL}_logprobs.jsonl
 ```
 
 **Key parameters:**
-- `--dtype bfloat16`: Model precision (saves VRAM)
+- `--concurrency N`: Maximum concurrent API requests (default: 32)
+- `--batch-size N`: Batch size for progress reporting (default: 64)
 - `--max-samples N`: Limit samples for testing
+- `--min-prefill N`: Skip prefill levels below N (default: 1, skips prefill0)
 - `--use-reasoning-field`: Use 'reasoning' instead of 'prefill_reasoning' field
+
+### 3.4 Legacy HuggingFace-based approach (slower)
+
+For cases where you can't run a vLLM server:
+
+```bash
+python scripts/compute_prefill_logprobs.py \
+    --checkpoint-dir results/sft_checkpoints/sft_*/checkpoints/checkpoint-{CKPT} \
+    --prefill-samples results/prefill_sensitivity/{RUN_NAME}/evals/checkpoint-{CKPT}_prefill{LEVEL}.jsonl.samples.jsonl \
+    --output results/logprob_analysis/checkpoint-{CKPT}_prefill{LEVEL}.jsonl \
+    --dtype bfloat16 --device cuda
+```
+
+**Note:** The legacy script uses HuggingFace's `tokenizer.apply_chat_template` which may produce slightly different results than the vLLM-based script. The vLLM script uses the exact same prompt format as djinn's generation (`build_harmony_prompt_string`), so its results are more accurate.
 
 ---
 
@@ -329,7 +356,13 @@ From the gpt-oss-20b training run:
 Use **SUM logprob** (log P(sequence)) for comparing across different prefill lengths. Mean logprob normalizes by length but loses the sequence probability interpretation.
 
 ### Harmony Format
-gpt-oss models use Harmony message format with `thinking` field. The scripts auto-detect this based on model path containing "gpt-oss" or "gpt_oss".
+gpt-oss models use Harmony message format. The vLLM logprob script (`compute_prefill_logprobs_vllm.py`) uses the exact same raw prompt format as djinn's generation:
+```
+<|start|>system<|message|>{system}<|end|>
+<|start|>user<|message|>{user}<|end|>
+<|start|>assistant<|channel|>analysis<|message|>{prefill_reasoning}
+```
+The scripts auto-detect Harmony format based on the `model_id` field in samples containing "gpt-oss" or "gpt_oss".
 
 ### Checkpoint 90
 The "threshold" checkpoint where 10-word prefill suffices for most problems. Used for computing the logprob threshold (-55.39 = E[sum_logprob(10-word prefill at checkpoint 90)]).
@@ -363,16 +396,14 @@ results/
 ├── prefill_sensitivity/
 │   └── prefill_sensitivity-{date}/
 │       ├── config.yaml              # Source of truth for checkpoints/prefill levels
-│       └── evals/
-│           ├── checkpoint-{N}_prefill{L}.jsonl
-│           └── checkpoint-{N}_prefill{L}.jsonl.samples.jsonl
+│       ├── evals/
+│       │   ├── checkpoint-{N}_prefill{L}.jsonl
+│       │   └── checkpoint-{N}_prefill{L}.jsonl.samples.jsonl
+│       └── logprob/                  # Logprob results (from compute_prefill_logprobs_vllm.py)
+│           └── checkpoint-{N}_prefill{L}_logprobs.jsonl
 ├── trajectory_analysis/
 │   ├── trajectory_analysis.csv
 │   └── *.png
-├── logprob_analysis/
-│   ├── logprob-{name}-prefill10/
-│   ├── logprob-{name}-prefill30/
-│   └── logprob-{name}-prefill100/
 ├── trajectory_analysis_with_logprob_complete/
 │   ├── trajectory_with_logprob.csv
 │   └── *.png
@@ -395,6 +426,6 @@ results/
 | `run_full_prefill_analysis.py` | **Orchestration** - runs full pipeline | `--sensitivity-run` |
 | `eval_prefill_sensitivity.py` | Stage 1: Evaluate prefill sensitivity | `--base-url`, `--prefill-from` |
 | `prefill_trajectory_analysis.py` | Stage 2: Token-based trajectory | `--run-dir` |
-| `run_logprob_analysis.py` | Stage 3: Batch logprob computation | `--prefill-run-dir`, `--sft-run-dir` |
-| `compute_prefill_logprobs.py` | Stage 3: Single checkpoint logprob | `--checkpoint-dir`, `--prefill-samples` |
+| `compute_prefill_logprobs_vllm.py` | **Stage 3: Logprob computation (recommended)** | `--base-url`, `--samples-dir` |
+| `compute_prefill_logprobs.py` | Stage 3: Legacy HuggingFace logprob | `--checkpoint-dir`, `--prefill-samples` |
 | `integrate_logprob_trajectory.py` | Stage 4: Merge and compare metrics | `--trajectory-csv`, `--logprob-dirs` |
