@@ -363,7 +363,7 @@ def _merge_lora_impl(adapter_path: Path, output_path: Path, gpu_id: int | None =
     print(f"  Merge complete: {output_path}")
 
 
-def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, gpu_id: int | None = None) -> Path:
+async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, gpu_id: int | None = None) -> Path:
     """Merge LoRA adapter with base model in a subprocess.
 
     Running in subprocess guarantees all GPU memory is freed when merge completes,
@@ -391,6 +391,7 @@ def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, g
             shutil.rmtree(output_path)
 
     # Run merge in subprocess to guarantee GPU memory is freed
+    # Use async subprocess to avoid blocking the event loop in data-parallel mode
     print(f"  Running merge in subprocess (ensures GPU memory cleanup)...")
     cmd = [
         sys.executable, __file__,
@@ -398,15 +399,46 @@ def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, g
         "--adapter-path", str(adapter_path),
         "--merge-output", str(output_path),
     ]
-    if gpu_id is not None:
-        cmd.extend(["--merge-gpu-id", str(gpu_id)])
 
-    result = subprocess.run(cmd, capture_output=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Merge subprocess failed with return code {result.returncode}")
+    # Set up environment to restrict subprocess to only see its assigned GPU
+    # This prevents accidental allocations on other GPUs during model loading
+    env = os.environ.copy()
+    if gpu_id is not None:
+        physical_gpu_id = get_physical_gpu_ids([gpu_id])[0]
+        env["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
+        print(f"  Merge subprocess will use GPU {gpu_id} (physical: {physical_gpu_id})")
+        # Don't pass --merge-gpu-id since subprocess now sees only one GPU (cuda:0)
+    else:
+        cmd.extend(["--merge-gpu-id", "0"])  # fallback
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+    )
+    stdout, _ = await proc.communicate()
+
+    if proc.returncode != 0:
+        print(f"  Merge subprocess output:\n{stdout.decode() if stdout else '(no output)'}")
+        raise RuntimeError(f"Merge subprocess failed with return code {proc.returncode}")
 
     if not output_path.exists():
         raise RuntimeError(f"Merge subprocess completed but output not found: {output_path}")
+
+    # Wait for GPU memory to be freed after merge subprocess exits
+    # GPU memory can linger briefly even after process terminates
+    if gpu_id is not None:
+        physical_gpu_ids = get_physical_gpu_ids([gpu_id])
+        print(f"  Waiting for GPU memory to be freed after merge (GPU {physical_gpu_ids})...")
+        if not _wait_for_gpu_memory_free(timeout=30, gpu_ids=physical_gpu_ids):
+            stuck_pids = _get_pids_using_gpus(physical_gpu_ids)
+            if stuck_pids:
+                print(f"  Killing processes still using GPU after merge: {stuck_pids}")
+                _kill_pids(stuck_pids, signal.SIGKILL)
+                time.sleep(2)
+            if not _wait_for_gpu_memory_free(timeout=15, gpu_ids=physical_gpu_ids):
+                print(f"  WARNING: GPU memory not freed after merge - vLLM may fail to start")
 
     return output_path
 
@@ -465,32 +497,6 @@ def _get_child_pids(parent_pid: int) -> list[int]:
         return [parent_pid]
 
 
-def _find_vllm_processes() -> list[int]:
-    """Find any lingering vLLM-related processes."""
-    pids = []
-    try:
-        # Look for vLLM server processes
-        result = subprocess.run(
-            ['pgrep', '-f', 'vllm.entrypoints.openai.api_server'],
-            capture_output=True, text=True, timeout=5
-        )
-        pids.extend(int(p) for p in result.stdout.strip().split() if p)
-    except Exception:
-        pass
-
-    try:
-        # Look for vLLM worker processes (multiproc_executor)
-        result = subprocess.run(
-            ['pgrep', '-f', 'from multiprocessing.spawn'],
-            capture_output=True, text=True, timeout=5
-        )
-        pids.extend(int(p) for p in result.stdout.strip().split() if p)
-    except Exception:
-        pass
-
-    return list(set(pids))
-
-
 def _kill_pids(pids: list[int], sig: int = signal.SIGKILL):
     """Kill a list of PIDs."""
     for pid in pids:
@@ -500,15 +506,35 @@ def _kill_pids(pids: list[int], sig: int = signal.SIGKILL):
             pass
 
 
-def _wait_for_gpu_memory_free(timeout: float = 60, poll_interval: float = 2.0) -> bool:
-    """Wait for GPU memory to be freed up."""
+def _get_pids_using_gpus(gpu_ids: list[int]) -> list[int]:
+    """Get PIDs of processes using specific GPUs."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '-i', ','.join(map(str, gpu_ids)),
+             '--query-compute-apps=pid', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=5
+        )
+        pids = [int(p.strip()) for p in result.stdout.strip().split('\n') if p.strip()]
+        return pids
+    except Exception:
+        return []
+
+
+def _wait_for_gpu_memory_free(timeout: float = 60, poll_interval: float = 2.0, gpu_ids: list[int] | None = None) -> bool:
+    """Wait for GPU memory to be freed up.
+
+    Args:
+        timeout: Max time to wait in seconds
+        poll_interval: Time between checks
+        gpu_ids: Physical GPU IDs to check. If None, checks all GPUs.
+    """
     start = time.time()
     while time.time() - start < timeout:
         try:
-            result = subprocess.run(
-                ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
-                capture_output=True, text=True, timeout=5
-            )
+            cmd = ['nvidia-smi', '--query-compute-apps=pid,gpu_uuid', '--format=csv,noheader']
+            if gpu_ids is not None:
+                cmd.extend(['-i', ','.join(map(str, gpu_ids))])
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             if not result.stdout.strip():
                 return True
         except Exception:
@@ -547,10 +573,12 @@ async def vllm_server(model_path: str | Path, port: int | None = None, tensor_pa
         "--max-num-seqs", str(16)
     ]
 
+    # Translate logical GPU IDs to physical IDs (needed for subprocess env and cleanup)
+    physical_gpu_ids = get_physical_gpu_ids(gpu_ids) if gpu_ids else None
+
     print(f"  Starting vLLM server on port {port}...")
     if gpu_ids:
-        physical_ids_for_print = get_physical_gpu_ids(gpu_ids)
-        print(f"  Using GPUs: {gpu_ids} (physical: {physical_ids_for_print})")
+        print(f"  Using GPUs: {gpu_ids} (physical: {physical_gpu_ids})")
     print(f"  Command: {' '.join(cmd)}")
 
     # Set up logging with unique file per server
@@ -564,11 +592,9 @@ async def vllm_server(model_path: str | Path, port: int | None = None, tensor_pa
         print(f"  Logging to: {log_path}")
 
     # Set up environment with GPU IDs if specified
-    # Translate logical IDs to physical IDs for subprocess
     env = os.environ.copy()
-    if gpu_ids is not None:
-        physical_ids = get_physical_gpu_ids(gpu_ids)
-        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, physical_ids))
+    if physical_gpu_ids is not None:
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, physical_gpu_ids))
     # Disable color output for readable logs
     env["NO_COLOR"] = "1"
     env["TERM"] = "dumb"
@@ -629,24 +655,23 @@ async def vllm_server(model_path: str | Path, port: int | None = None, tensor_pa
         except Exception:
             pass
 
-        # Step 5: Find and kill any lingering vLLM processes
+        # Step 5: Wait for GPU memory to be released on this server's GPUs only
+        # Note: We only check the specific GPUs assigned to this server, not all GPUs,
+        # to avoid blocking on other parallel slots that are still actively serving.
         time.sleep(2)
-        lingering = _find_vllm_processes()
-        if lingering:
-            print(f"  Killing lingering vLLM processes: {lingering}")
-            _kill_pids(lingering, signal.SIGKILL)
-
-        # Step 6: Wait for GPU memory to be released
-        print(f"  Waiting for GPU memory to be released...")
-        if not _wait_for_gpu_memory_free(timeout=30):
-            print(f"  WARNING: GPU memory still in use after cleanup, waiting longer...")
-            # Try one more aggressive cleanup
-            lingering = _find_vllm_processes()
-            if lingering:
-                print(f"  Final cleanup of PIDs: {lingering}")
-                _kill_pids(lingering, signal.SIGKILL)
-            if not _wait_for_gpu_memory_free(timeout=30):
-                print(f"  WARNING: GPU memory still occupied - next server may fail to start")
+        if physical_gpu_ids:
+            print(f"  Waiting for GPU memory to be released on GPUs {physical_gpu_ids}...")
+            if not _wait_for_gpu_memory_free(timeout=30, gpu_ids=physical_gpu_ids):
+                # Find and kill any processes still using these GPUs
+                stuck_pids = _get_pids_using_gpus(physical_gpu_ids)
+                if stuck_pids:
+                    print(f"  Killing processes still using GPUs {physical_gpu_ids}: {stuck_pids}")
+                    _kill_pids(stuck_pids, signal.SIGKILL)
+                    time.sleep(2)
+                # Wait again after killing
+                if not _wait_for_gpu_memory_free(timeout=30, gpu_ids=physical_gpu_ids):
+                    stuck_pids = _get_pids_using_gpus(physical_gpu_ids)
+                    print(f"  WARNING: GPU memory still occupied by {stuck_pids} - next server may fail to start")
 
         # Close log file if open
         if log_file:
@@ -1024,18 +1049,20 @@ async def evaluate_single_checkpoint(
     args,
     prefill_provider: PrefillProvider,
     prefill_token_values: list[int],
-    semaphore: asyncio.Semaphore,
+    slot_lock: asyncio.Lock,
     parallel_slot: int = 0,
 ) -> tuple[str, dict]:
     """Evaluate a single checkpoint.
 
     Args:
+        slot_lock: Lock for this checkpoint's GPU slot, ensuring only one checkpoint
+                   uses each GPU set at a time.
         parallel_slot: Which parallel slot (0 to data_parallel-1) this checkpoint occupies.
                        Used to assign non-overlapping GPUs.
 
     Returns (checkpoint_name, results_dict).
     """
-    async with semaphore:
+    async with slot_lock:
         print(f"\n{'='*60}")
         print(f"Checkpoint {checkpoint_idx+1}/{total_checkpoints}: {checkpoint.name}")
         print(f"{'='*60}")
@@ -1086,7 +1113,7 @@ async def evaluate_single_checkpoint(
         if not args.skip_merge:
             print(f"\n[1/3] Merging LoRA adapter on GPU {gpu_ids[0]}...")
             # Use first GPU from assigned set for merge (only needs one GPU)
-            merged_path = merge_lora_checkpoint(checkpoint, gpu_id=gpu_ids[0])
+            merged_path = await merge_lora_checkpoint(checkpoint, gpu_id=gpu_ids[0])
         else:
             merged_path = checkpoint.parent / f"{checkpoint.name}_merged"
             if not merged_path.exists():
@@ -1182,9 +1209,13 @@ async def main_async(args):
     # Evaluate all checkpoints in parallel
     print(f"\nEvaluating {len(checkpoints)} checkpoints with data_parallel={data_parallel}...")
 
-    semaphore = asyncio.Semaphore(data_parallel)
+    # Use per-slot locks instead of a global semaphore to prevent GPU double-booking.
+    # Each slot (GPU set) has its own lock, so checkpoints assigned to the same slot
+    # are serialized, while checkpoints on different slots run in parallel.
+    slot_locks = [asyncio.Lock() for _ in range(data_parallel)]
     tasks = []
     for i, checkpoint in enumerate(checkpoints):
+        slot = i % data_parallel
         task = evaluate_single_checkpoint(
             checkpoint=checkpoint,
             checkpoint_idx=i,
@@ -1192,8 +1223,8 @@ async def main_async(args):
             args=args,
             prefill_provider=prefill_provider,
             prefill_token_values=prefill_token_values,
-            semaphore=semaphore,
-            parallel_slot=i % data_parallel,
+            slot_lock=slot_locks[slot],
+            parallel_slot=slot,
         )
         tasks.append(task)
 
