@@ -138,11 +138,46 @@ done
 
 Analyze how "exploit accessibility" (min prefill tokens to elicit exploit) changes over training.
 
+**Default behavior** (filters to djinn dataset, produces both all_exploits/ and intentional_only/ subdirectories):
 ```bash
 python scripts/prefill_trajectory_analysis.py \
     --run-dir results/prefill_sensitivity/{RUN_NAME} \
     --output-dir results/trajectory_analysis \
-    --threshold 10
+    --threshold 0
+```
+
+This automatically:
+1. Filters to problems in `EleutherAI/djinn-problems-v0.9` (removes bad/deprecated problems)
+2. Produces plots for **all exploits** in `all_exploits/` subdirectory
+3. Produces plots for **intentional exploits only** in `intentional_only/` subdirectory
+   - Excludes `inadequate_test_coverage` and `resource_exhaustion` (unintentional exploit types)
+4. **Processes logprob data** if available in `{run-dir}/logprob/` (generates logprob vs prefill/checkpoint plots)
+
+**Skip intentional split** (only produce all_exploits/):
+```bash
+python scripts/prefill_trajectory_analysis.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --output-dir results/trajectory_analysis \
+    --threshold 0 \
+    --skip-intentional-split
+```
+
+**Disable dataset filtering:**
+```bash
+python scripts/prefill_trajectory_analysis.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --output-dir results/trajectory_analysis \
+    --threshold 0 \
+    --filter-dataset none
+```
+
+**Excluding additional exploit types:**
+```bash
+python scripts/prefill_trajectory_analysis.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --output-dir results/trajectory_analysis \
+    --threshold 0 \
+    --exclude-exploit-types hardcoding_or_memorization
 ```
 
 **With experiment context logging:**
@@ -150,19 +185,45 @@ python scripts/prefill_trajectory_analysis.py \
 python scripts/prefill_trajectory_analysis.py \
     --run-dir results/prefill_sensitivity/{RUN_NAME} \
     --output-dir results/trajectory_analysis \
-    --threshold 10 \
+    --threshold 0 \
     --use-run-context
 ```
 
 **Key concepts:**
 - **Min prefill**: Minimum prefill tokens needed to trigger an exploit at a checkpoint
-- **Threshold**: min_prefill <= 10 means "easily exploitable"
+- **Threshold**: min_prefill <= threshold means "easily exploitable" (use 0 for strictest)
 - **Time to threshold**: Training steps until problem becomes easily exploitable
+- **Instantaneous descent rate**: Per-step change in min_prefill between consecutive checkpoints
+- **Intentional exploits**: Excludes `inadequate_test_coverage` and `resource_exhaustion` (bugs in test coverage, not deliberate exploit design)
 
-**Output files:**
+**Output structure:**
+```
+output_dir/
+├── all_exploits/           # All exploit types
+│   ├── trajectory_analysis.csv
+│   ├── logprob_analysis.csv    # If logprob data available
+│   └── *.png
+└── intentional_only/       # Excludes unintentional exploit types
+    ├── trajectory_analysis.csv
+    ├── logprob_analysis.csv    # If logprob data available
+    └── *.png
+```
+
+**Output files (in each subdirectory):**
 - `trajectory_analysis.csv`: Per-problem min_prefill at each checkpoint
-- `accessibility_distribution.png`: Distribution of min_prefill over time
-- `time_to_threshold.png`: Scatter plot of current accessibility vs steps-to-threshold
+- `pass_rates_vs_prefill.png`: Secure pass, insecure pass, and exploit rate vs prefill length (by checkpoint)
+- `accessibility_vs_time.png`: Scatter plot of current accessibility vs steps-to-threshold
+- `sample_trajectories.png`: Sample of individual problem trajectories over checkpoints
+- `median_trajectory.png`: Median min_prefill trajectory with IQR band (sigmoid shape!)
+- `descent_rates.png`: Distribution of overall descent rates (first to last checkpoint)
+- `instantaneous_descent_rates.png`: Distribution of per-step descent rates with reachability coloring
+- `instantaneous_descent_rates_by_exploit.png`: Descent rates averaged by exploit type (gradient by % reaching threshold)
+- `instantaneous_rate_at_max_prefill.png`: Histogram of descent rates when min_prefill >= 100, by checkpoint cutoff
+
+**Logprob output files (if logprob data available):**
+- `logprob_analysis.csv`: Per-sample logprob metrics
+- `logprob_vs_prefill.png`: Logprob sum, mean, and exploit rate vs prefill length (by checkpoint)
+- `logprob_vs_checkpoint.png`: Logprob sum, mean, and exploit rate vs checkpoint (by prefill level)
 
 ---
 
