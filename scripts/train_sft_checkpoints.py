@@ -125,10 +125,14 @@ def build_prompt(row: Dict[str, Any], add_exploit_context: bool = False) -> str:
     return "\n\n".join(parts) + "\n\n"
 
 
-def to_prompt_completion(example: Dict[str, Any], add_exploit_context: bool = False) -> Dict[str, Any]:
+def to_prompt_completion(
+    example: Dict[str, Any],
+    add_exploit_context: bool = False,
+    completion_column: str = "exploit",
+) -> Dict[str, Any]:
     """Convert dataset row to prompt/completion format."""
     prompt_text = build_prompt(example, add_exploit_context=add_exploit_context)
-    completion_text = example.get("exploit", "")
+    completion_text = example.get(completion_column, "")
     if "```python" not in completion_text:
         completion_text = f"```python\n{completion_text}\n```END"
     return {"prompt": prompt_text, "completion": completion_text}
@@ -341,6 +345,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_length", type=int, default=3072, help="Max sequence length (djinn data max is ~3056)")
     parser.add_argument("--exploit_context", action="store_true",
                         help="Add explicit exploit-eliciting context to prompts (default: neutral prompts)")
+    parser.add_argument(
+        "--completion_column",
+        type=str,
+        default="exploit",
+        help="Dataset column to use as completion (exploit, ground_truth)",
+    )
 
     # Checkpoints
     parser.add_argument(
@@ -374,6 +384,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Comma-separated exploit types to exclude",
+    )
+    parser.add_argument(
+        "--preformatted",
+        action="store_true",
+        help="Dataset already has prompt/completion columns, skip build_prompt",
     )
 
     return parser.parse_args()
@@ -411,19 +426,29 @@ def main():
     print(f"Train examples: {len(train_dataset)}, Eval examples: {len(eval_dataset)}")
 
     # Convert to prompt/completion format
-    def _to_pc(example):
-        return to_prompt_completion(example, add_exploit_context=args.exploit_context)
+    if args.preformatted:
+        # Dataset already has prompt/completion columns
+        print("Using preformatted prompt/completion columns")
+        train_pc = train_dataset.select_columns(["prompt", "completion"])
+        eval_pc = eval_dataset.select_columns(["prompt", "completion"])
+    else:
+        def _to_pc(example):
+            return to_prompt_completion(
+                example,
+                add_exploit_context=args.exploit_context,
+                completion_column=args.completion_column,
+            )
 
-    train_pc = train_dataset.map(
-        _to_pc,
-        remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
-        desc="Format train",
-    )
-    eval_pc = eval_dataset.map(
-        _to_pc,
-        remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
-        desc="Format eval",
-    )
+        train_pc = train_dataset.map(
+            _to_pc,
+            remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
+            desc="Format train",
+        )
+        eval_pc = eval_dataset.map(
+            _to_pc,
+            remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
+            desc="Format eval",
+        )
 
     # Calculate training steps
     steps_per_epoch = len(train_dataset) // (

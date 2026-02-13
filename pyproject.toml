@@ -26,6 +26,8 @@ dependencies = [
     "tqdm",
     "pyyaml",
     "lifelines>=0.30.0",
+    "magic-wormhole>=0.22.0",
+    "scikit-learn>=1.8.0",
 ]
 
 [tool.uv.sources]

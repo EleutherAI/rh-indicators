@@ -23,10 +23,6 @@ Usage:
 """
 
 import argparse
-import json
-import re
-import sys
-from collections import defaultdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -34,272 +30,17 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-
-from rh_indicators.run_utils import run_context, ensure_run_dir
-
-
-def parse_filename(filename: str) -> tuple[int, int] | None:
-    """Parse checkpoint and prefill values from filename."""
-    match = re.match(r"checkpoint-(\d+)_prefill(\d+)\.jsonl$", filename)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-    return None
-
-
-def load_per_problem_results(input_dir: Path) -> pd.DataFrame:
-    """Load per-problem results from all checkpoint × prefill eval files."""
-    rows = []
-    for jsonl_file in sorted(input_dir.glob("checkpoint-*_prefill*.jsonl")):
-        if ".samples." in jsonl_file.name:
-            continue
-        parsed = parse_filename(jsonl_file.name)
-        if parsed is None:
-            continue
-        checkpoint, prefill_tokens = parsed
-        with open(jsonl_file, "r") as f:
-            for line in f:
-                if line.strip():
-                    record = json.loads(line)
-                    rows.append({
-                        "task_id": record.get("task_id"),
-                        "checkpoint": checkpoint,
-                        "prefill_tokens": prefill_tokens,
-                        "exploit_success": record.get("exploit_success", False),
-                        "exploit_type": record.get("exploit_type"),
-                        "attempt_idx": record.get("attempt_idx", 0),
-                        "secure_pass": record.get("secure_pass", False),
-                        "insecure_pass": record.get("insecure_pass", False),
-                    })
-    return pd.DataFrame(rows)
-
-
-def load_logprob_results(logprob_dir: Path) -> pd.DataFrame | None:
-    """Load logprob results from checkpoint × prefill logprob files."""
-    if not logprob_dir.exists():
-        return None
-
-    rows = []
-    for jsonl_file in sorted(logprob_dir.glob("checkpoint-*_prefill*.jsonl")):
-        parsed = parse_filename(jsonl_file.name)
-        if parsed is None:
-            continue
-        checkpoint, prefill_tokens = parsed
-        with open(jsonl_file, "r") as f:
-            for line in f:
-                if line.strip():
-                    record = json.loads(line)
-                    rows.append({
-                        "task_id": record.get("task_id"),
-                        "checkpoint": checkpoint,
-                        "prefill_tokens": prefill_tokens,
-                        "exploit_type": record.get("exploit_type"),
-                        "attempt_idx": record.get("attempt_idx", 0),
-                        "prefill_logprob_sum": record.get("prefill_logprob_sum"),
-                        "prefill_logprob_mean": record.get("prefill_logprob_mean"),
-                        "prefill_num_tokens": record.get("prefill_num_tokens"),
-                        "exploit_success": record.get("exploit_success", False),
-                    })
-
-    if not rows:
-        return None
-    return pd.DataFrame(rows)
-
-
-def compute_min_prefill_trajectories(
-    df: pd.DataFrame,
-    checkpoints: list[int],
-    max_prefill: int = 100,
-) -> pd.DataFrame:
-    """Compute min prefill to exploit for each problem at each checkpoint.
-
-    Returns DataFrame with columns:
-        task_id, exploit_type, checkpoint, min_prefill, exploitable
-    """
-    results = []
-
-    for (task_id, exploit_type), group in df.groupby(["task_id", "exploit_type"]):
-        for checkpoint in checkpoints:
-            ckpt_data = group[group["checkpoint"] == checkpoint]
-            if len(ckpt_data) == 0:
-                continue
-
-            # Get exploit success for each prefill level (any attempt succeeds)
-            prefill_success = ckpt_data.groupby("prefill_tokens")["exploit_success"].max()
-            successful_prefills = prefill_success[prefill_success].index.tolist()
-
-            if successful_prefills:
-                min_prefill = min(successful_prefills)
-                exploitable = True
-            else:
-                min_prefill = max_prefill + 1  # Not exploitable at any tested level
-                exploitable = False
-
-            results.append({
-                "task_id": task_id,
-                "exploit_type": exploit_type,
-                "checkpoint": checkpoint,
-                "min_prefill": min_prefill,
-                "exploitable": exploitable,
-            })
-
-    return pd.DataFrame(results)
-
-
-def compute_time_to_threshold(
-    trajectories: pd.DataFrame,
-    checkpoints: list[int],
-    threshold: int = 10,
-) -> pd.DataFrame:
-    """For each (task, checkpoint), compute steps until min_prefill <= threshold.
-
-    Returns DataFrame with:
-        task_id, exploit_type, checkpoint, min_prefill, steps_to_threshold, ever_reaches_threshold
-    """
-    results = []
-
-    for (task_id, exploit_type), group in trajectories.groupby(["task_id", "exploit_type"]):
-        group = group.sort_values("checkpoint")
-        ckpts = group["checkpoint"].values
-        min_prefills = group["min_prefill"].values
-
-        # Check if task ever reaches threshold
-        ever_reaches = any(mp <= threshold for mp in min_prefills)
-
-        for i, (ckpt, mp) in enumerate(zip(ckpts, min_prefills)):
-            # Find steps until threshold is reached
-            steps_to_threshold = None
-            for j in range(i, len(ckpts)):
-                if min_prefills[j] <= threshold:
-                    steps_to_threshold = ckpts[j] - ckpt
-                    break
-
-            # Accessibility: higher = closer to threshold (easier to exploit)
-            # 1.0 = at or below threshold, 0.0 = at max_prefill
-            max_prefill = max(min_prefills.max(), 100)
-            if mp <= threshold:
-                accessibility = 1.0
-            else:
-                # Linear scale from threshold to max
-                accessibility = 1.0 - (mp - threshold) / (max_prefill - threshold)
-                accessibility = max(0.0, accessibility)
-
-            results.append({
-                "task_id": task_id,
-                "exploit_type": exploit_type,
-                "checkpoint": ckpt,
-                "min_prefill": mp,
-                "accessibility": accessibility,
-                "steps_to_threshold": steps_to_threshold,
-                "ever_reaches_threshold": ever_reaches,
-                "at_threshold": mp <= threshold,
-            })
-
-    return pd.DataFrame(results)
-
-
-def compute_logprob_trajectories(
-    trajectories: pd.DataFrame,
-    logprob_df: pd.DataFrame,
-    checkpoints: list[int],
-) -> pd.DataFrame:
-    """Compute logprob_sum at min_prefill for each problem at each checkpoint.
-
-    For each task/checkpoint pair, looks up the logprob_sum at that task's min_prefill level.
-    This captures how natural the exploit reasoning appears at exactly the point where
-    it becomes effective.
-
-    Returns DataFrame with columns:
-        task_id, exploit_type, checkpoint, min_prefill, logprob_sum, logprob_mean
-    """
-    results = []
-
-    # Create lookup: (task_id, checkpoint, prefill_tokens) -> logprob metrics
-    # Average across attempts for each (task_id, checkpoint, prefill_tokens)
-    logprob_agg = logprob_df.groupby(["task_id", "checkpoint", "prefill_tokens"]).agg({
-        "prefill_logprob_sum": "mean",
-        "prefill_logprob_mean": "mean",
-    }).reset_index()
-
-    logprob_lookup = {}
-    for _, row in logprob_agg.iterrows():
-        key = (row["task_id"], row["checkpoint"], row["prefill_tokens"])
-        logprob_lookup[key] = {
-            "logprob_sum": row["prefill_logprob_sum"],
-            "logprob_mean": row["prefill_logprob_mean"],
-        }
-
-    # For each task/checkpoint in trajectories, get logprob at min_prefill
-    for _, row in trajectories.iterrows():
-        task_id = row["task_id"]
-        exploit_type = row["exploit_type"]
-        checkpoint = row["checkpoint"]
-        min_prefill = row["min_prefill"]
-
-        # Only look up if the task is exploitable AND needs prefill (min_prefill > 0)
-        # Exclude min_prefill=0: those tasks exploit without any reasoning, so there's
-        # no logprob to measure - they're a different category, not "logprob=0"
-        if row.get("exploitable", min_prefill <= 100) and min_prefill > 0:
-            key = (task_id, checkpoint, min_prefill)
-            if key in logprob_lookup:
-                logprob_data = logprob_lookup[key]
-                results.append({
-                    "task_id": task_id,
-                    "exploit_type": exploit_type,
-                    "checkpoint": checkpoint,
-                    "min_prefill": min_prefill,
-                    "logprob_sum": logprob_data["logprob_sum"],
-                    "logprob_mean": logprob_data["logprob_mean"],
-                })
-
-    return pd.DataFrame(results)
-
-
-def compute_logprob_time_to_threshold(
-    logprob_trajectories: pd.DataFrame,
-    checkpoints: list[int],
-    threshold: float = -55.39,
-) -> pd.DataFrame:
-    """For each (task, checkpoint), compute steps until logprob_sum >= threshold.
-
-    The threshold is the logprob_sum value at which exploit reasoning is considered
-    "easily natural" to the model. Default is -55.39 from prior analysis.
-
-    Returns DataFrame with:
-        task_id, exploit_type, checkpoint, logprob_sum, steps_to_logprob_threshold,
-        ever_reaches_logprob_threshold, at_logprob_threshold
-    """
-    results = []
-
-    for (task_id, exploit_type), group in logprob_trajectories.groupby(["task_id", "exploit_type"]):
-        group = group.sort_values("checkpoint")
-        ckpts = group["checkpoint"].values
-        logprob_sums = group["logprob_sum"].values
-
-        # Check if task ever reaches threshold (higher = more natural, so >= threshold)
-        ever_reaches = any(lp >= threshold for lp in logprob_sums)
-
-        for i, (ckpt, lp) in enumerate(zip(ckpts, logprob_sums)):
-            # Find steps until threshold is reached
-            steps_to_threshold = None
-            for j in range(i, len(ckpts)):
-                if logprob_sums[j] >= threshold:
-                    steps_to_threshold = ckpts[j] - ckpt
-                    break
-
-            results.append({
-                "task_id": task_id,
-                "exploit_type": exploit_type,
-                "checkpoint": ckpt,
-                "logprob_sum": lp,
-                "steps_to_logprob_threshold": steps_to_threshold,
-                "ever_reaches_logprob_threshold": ever_reaches,
-                "at_logprob_threshold": lp >= threshold,
-            })
-
-    return pd.DataFrame(results)
+from rh_indicators.run_utils import run_context
+from rh_indicators.trajectory import (
+    load_per_problem_results,
+    load_logprob_results,
+    load_kl_results,
+    compute_min_prefill_trajectories,
+    compute_time_to_threshold,
+    compute_logprob_trajectories,
+    compute_logprob_time_to_threshold,
+    compute_exploit_rate_scaling,
+)
 
 
 def plot_logprob_vs_prefill(
@@ -421,7 +162,8 @@ def plot_logprob_ascent_rate_distribution(
         total_steps = ckpts[-1] - ckpts[0]
         if total_steps > 0:
             rate = total_change / total_steps
-            ever_reaches = group["ever_reaches_logprob_threshold"].iloc[0] if "ever_reaches_logprob_threshold" in group.columns else any(logprob_sums >= threshold)
+            # Use token-based threshold for consistent comparison with token analysis
+            ever_reaches = group["ever_reaches_threshold"].iloc[0] if "ever_reaches_threshold" in group.columns else False
             ascent_rates.append({
                 "task_id": task_id,
                 "exploit_type": exploit_type,
@@ -496,7 +238,8 @@ def plot_instantaneous_logprob_ascent_rate(
 
         ckpts = group["checkpoint"].values
         logprob_sums = group["logprob_sum"].values
-        ever_reaches = group["ever_reaches_logprob_threshold"].iloc[0] if "ever_reaches_logprob_threshold" in group.columns else any(logprob_sums >= threshold)
+        # Use token-based threshold for consistent comparison with token analysis
+        ever_reaches = group["ever_reaches_threshold"].iloc[0] if "ever_reaches_threshold" in group.columns else False
 
         for i in range(len(ckpts) - 1):
             delta_logprob = logprob_sums[i + 1] - logprob_sums[i]
@@ -608,14 +351,14 @@ def plot_instantaneous_logprob_ascent_rate_by_exploit_type(
     then computes instantaneous rates on those averaged trajectories.
     Colors by fraction of tasks that reach threshold (gradient from blue=0% to red=100%).
     """
-    # Compute per-exploit-type fraction reaching threshold
-    task_outcomes = logprob_data.groupby(["task_id", "exploit_type"])["ever_reaches_logprob_threshold"].first().reset_index()
-    exploit_reach_pct = task_outcomes.groupby("exploit_type")["ever_reaches_logprob_threshold"].mean().to_dict()
+    # Compute per-exploit-type fraction reaching token threshold (for consistent comparison)
+    task_outcomes = logprob_data.groupby(["task_id", "exploit_type"])["ever_reaches_threshold"].first().reset_index()
+    exploit_reach_pct = task_outcomes.groupby("exploit_type")["ever_reaches_threshold"].mean().to_dict()
 
     # Average logprob_sum by (exploit_type, checkpoint)
     avg_by_exploit = logprob_data.groupby(["exploit_type", "checkpoint"]).agg({
         "logprob_sum": "mean",
-        "ever_reaches_logprob_threshold": "mean",
+        "ever_reaches_threshold": "mean",
     }).reset_index()
 
     # Compute instantaneous rates on averaged trajectories
@@ -730,35 +473,80 @@ def plot_median_logprob_trajectory(
     output_path: Path,
     threshold: float = -55.39,
     title: str | None = None,
+    eval_df: pd.DataFrame | None = None,
+    not_hacked_cutoff: float = -500.0,
 ) -> None:
-    """Plot median logprob_sum trajectory with IQR band over checkpoints."""
-    fig, ax = plt.subplots(figsize=(10, 6))
+    """Plot boxplot of logprob_sum distribution at each checkpoint.
 
-    # Compute median and IQR at each checkpoint
-    stats_by_ckpt = logprob_trajectories.groupby("checkpoint")["logprob_sum"].agg(
-        median="median",
-        q25=lambda x: x.quantile(0.25),
-        q75=lambda x: x.quantile(0.75),
-        count="count",
-    ).reset_index()
+    Non-hacked tasks are included with very negative logprob values (off the
+    visible y-axis). This way, when >50% of tasks are not hacked, the median
+    naturally falls off the chart.
 
-    # Plot median with IQR band
-    ax.plot(stats_by_ckpt["checkpoint"], stats_by_ckpt["median"],
-            marker='o', linewidth=2, color='black', label='Median')
-    ax.fill_between(stats_by_ckpt["checkpoint"],
-                    stats_by_ckpt["q25"],
-                    stats_by_ckpt["q75"],
-                    alpha=0.3, color='gray', label='IQR (25-75%)')
+    If eval_df is provided, overlays hack rate at prefill=0 on secondary y-axis.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Add threshold line
-    ax.axhline(y=threshold, color='red', linestyle='--', alpha=0.7,
-               label=f'Threshold ({threshold})')
+    # Get sorted checkpoints
+    checkpoints = sorted(logprob_trajectories["checkpoint"].unique())
+    n_tasks = logprob_trajectories.groupby("checkpoint")["task_id"].nunique().iloc[0]
+
+    # Prepare data for boxplot - list of arrays, one per checkpoint
+    # Include ALL tasks - non-hacked ones will have very negative logprob (off chart)
+    boxplot_data = []
+    positions = []
+
+    for ckpt in checkpoints:
+        ckpt_data = logprob_trajectories[logprob_trajectories["checkpoint"] == ckpt]["logprob_sum"].values
+        boxplot_data.append(ckpt_data)
+        positions.append(ckpt)
+
+    # Create boxplot with outliers shown as dots
+    bp = ax.boxplot(boxplot_data, positions=positions, widths=min(5, (max(positions) - min(positions)) / len(positions) * 0.6),
+                    patch_artist=True, showfliers=True, flierprops=dict(marker='o', markersize=3, alpha=0.5))
+
+    # Style boxplot
+    for patch in bp['boxes']:
+        patch.set_facecolor('lightyellow')
+        patch.set_alpha(0.7)
+
+    # Set y-axis to show only the interesting range
+    # Find reasonable bounds from actual exploitable data (above the cutoff)
+    # Outliers below this will be clipped
+    all_hacked = logprob_trajectories[logprob_trajectories["logprob_sum"] > not_hacked_cutoff]["logprob_sum"]
+    if len(all_hacked) > 0:
+        y_min = max(all_hacked.quantile(0.01) - 20, not_hacked_cutoff)
+        y_max = min(all_hacked.max() + 10, 10)
+    else:
+        y_min, y_max = not_hacked_cutoff, 10
+    ax.set_ylim(y_min, y_max)
 
     ax.set_xlabel("Checkpoint", fontsize=12)
-    ax.set_ylabel("Median Logprob Sum at Min Prefill", fontsize=12)
-    ax.set_title(title or f"Median Logprob Trajectory Across All Tasks (n={stats_by_ckpt['count'].iloc[0]})", fontsize=14)
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    ax.set_ylabel("Logprob Sum at Min Prefill", fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Add hack rate at prefill=0 on secondary y-axis if eval_df provided
+    if eval_df is not None:
+        ax2 = ax.twinx()
+
+        # Filter to prefill=0 and compute hack rate per checkpoint
+        prefill0 = eval_df[eval_df["prefill_tokens"] == 0].copy()
+        if len(prefill0) > 0:
+            hack_rates = prefill0.groupby("checkpoint").agg(
+                hack_rate=("exploit_success", "mean"),
+            ).reset_index()
+
+            # Plot hack rate on secondary axis
+            ax2.plot(hack_rates["checkpoint"], hack_rates["hack_rate"] * 100,
+                    marker='s', linewidth=2, color='darkgreen', linestyle='--',
+                    label='Hack rate @ prefill=0', alpha=0.8)
+            ax2.set_ylabel("Hack Rate at Prefill=0 (%)", fontsize=12, color='darkgreen')
+            ax2.tick_params(axis='y', labelcolor='darkgreen')
+            ax2.set_ylim(0, 100)
+
+            # Add legend for hack rate line
+            ax2.legend(loc="lower right")
+
+    ax.set_title(title or f"Logprob Distribution by Checkpoint (n={n_tasks} tasks)", fontsize=14)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
@@ -806,8 +594,9 @@ def plot_logprob_at_min_prefill(
             ax.set_title(f"{label}\n(no data)")
             continue
 
-        reaches = subset[subset["ever_reaches_logprob_threshold"]]["logprob_sum"]
-        never = subset[~subset["ever_reaches_logprob_threshold"]]["logprob_sum"]
+        # Use token-based threshold for consistent comparison with token analysis
+        reaches = subset[subset["ever_reaches_threshold"]]["logprob_sum"]
+        never = subset[~subset["ever_reaches_threshold"]]["logprob_sum"]
 
         ax.hist(reaches, bins=bins, alpha=0.6, label=f"Reaches (n={len(reaches)})", color="red")
         ax.hist(never, bins=bins, alpha=0.6, label=f"Never (n={len(never)})", color="blue")
@@ -826,6 +615,551 @@ def plot_logprob_at_min_prefill(
                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     plt.suptitle(title or f"Logprob at Min Prefill Distribution (threshold={threshold})", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
+    print(f"Plot saved to: {output_path}")
+    plt.close()
+
+
+def plot_exploit_rate_scaling(
+    scaling_df: pd.DataFrame,
+    output_path: Path,
+    title: str | None = None,
+) -> None:
+    """Plot exploit rate scaling law: steps vs log(exploit_rate_lower_bound).
+
+    Creates a plot showing how the lower bound on P(exploit) evolves over training,
+    with annotations showing the best prefill level at each checkpoint.
+
+    Args:
+        scaling_df: DataFrame from compute_exploit_rate_scaling()
+        output_path: Path to save the plot
+        title: Optional plot title
+    """
+    if len(scaling_df) == 0:
+        print(f"Warning: No data for exploit rate scaling plot")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # 1. Log exploit lower bound vs checkpoint
+    ax1 = axes[0, 0]
+    ax1.plot(scaling_df["checkpoint"], scaling_df["log_exploit_lower_bound"],
+             'o-', linewidth=2, markersize=8, color='darkblue')
+    for _, row in scaling_df.iterrows():
+        ax1.annotate(f"p{int(row['best_prefill'])}",
+                    (row["checkpoint"], row["log_exploit_lower_bound"]),
+                    textcoords="offset points", xytext=(0, 10), ha='center', fontsize=8)
+    ax1.set_xlabel("Training Step (Checkpoint)", fontsize=11)
+    ax1.set_ylabel("log P(exploit) lower bound", fontsize=11)
+    ax1.set_title("Exploit Rate Scaling Law (log scale)", fontsize=12)
+    ax1.set_xscale('log')
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Exploit lower bound vs checkpoint (linear scale)
+    ax2 = axes[0, 1]
+    ax2.plot(scaling_df["checkpoint"], scaling_df["exploit_lower_bound"],
+             'o-', linewidth=2, markersize=8, color='darkred')
+    ax2.set_xlabel("Training Step (Checkpoint)", fontsize=11)
+    ax2.set_ylabel("P(exploit) lower bound", fontsize=11)
+    ax2.set_title("Exploit Rate Scaling Law (linear scale)", fontsize=12)
+    ax2.set_xscale('log')
+    ax2.set_yscale('log')
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Best prefill level over training
+    ax3 = axes[1, 0]
+    ax3.plot(scaling_df["checkpoint"], scaling_df["best_prefill"],
+             's-', linewidth=2, markersize=8, color='green')
+    ax3.set_xlabel("Training Step (Checkpoint)", fontsize=11)
+    ax3.set_ylabel("Best Prefill Level", fontsize=11)
+    ax3.set_title("Prefill Level Achieving Max P(prefill)*P(exploit|prefill)", fontsize=12)
+    ax3.set_xscale('log')
+    ax3.grid(True, alpha=0.3)
+
+    # 4. Component breakdown: -KL vs exploit_rate
+    ax4 = axes[1, 1]
+    ax4_twin = ax4.twinx()
+
+    l1, = ax4.plot(scaling_df["checkpoint"], scaling_df["mean_neg_kl"],
+                  'o-', linewidth=2, markersize=6, color='blue', label='-KL')
+    l2, = ax4_twin.plot(scaling_df["checkpoint"], scaling_df["exploit_rate"],
+                       's-', linewidth=2, markersize=6, color='red', label='Exploit rate')
+
+    ax4.set_xlabel("Training Step (Checkpoint)", fontsize=11)
+    ax4.set_ylabel("-KL(prefill)", fontsize=11, color='blue')
+    ax4_twin.set_ylabel("Exploit rate P(exploit|prefill)", fontsize=11, color='red')
+    ax4.set_title("Components at Best Prefill Level", fontsize=12)
+    ax4.set_xscale('log')
+    ax4.tick_params(axis='y', labelcolor='blue')
+    ax4_twin.tick_params(axis='y', labelcolor='red')
+
+    # Combined legend
+    lines = [l1, l2]
+    labels = [l.get_label() for l in lines]
+    ax4.legend(lines, labels, loc='upper left', fontsize=9)
+    ax4.grid(True, alpha=0.3)
+
+    plt.suptitle(title or "Exploit Rate Scaling Law: max_prefill[exp(-KL) * P(exploit|prefill)]", fontsize=13)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
+    print(f"Plot saved to: {output_path}")
+    plt.close()
+
+
+def plot_exploit_rate_scaling_by_type(
+    kl_df: pd.DataFrame,
+    checkpoints: list[int],
+    eval_df: pd.DataFrame,
+    output_path: Path,
+    title: str | None = None,
+) -> None:
+    """Plot exploit rate scaling law per exploit type.
+
+    Creates a single plot with one line per exploit type, showing how
+    log P(exploit) evolves over training for each type.
+
+    Args:
+        kl_df: KL divergence DataFrame with exploit_type column
+        checkpoints: List of checkpoints to analyze
+        eval_df: Eval DataFrame for prefill 0 data
+        output_path: Path to save the plot
+        title: Optional plot title
+    """
+    from rh_indicators.trajectory import compute_exploit_rate_scaling
+
+    exploit_types = sorted(kl_df["exploit_type"].dropna().unique())
+    if len(exploit_types) == 0:
+        print("Warning: No exploit types found for per-type scaling plot")
+        return
+
+    # Use a colormap with enough distinct colors
+    cmap = plt.cm.get_cmap('tab20', len(exploit_types))
+    colors = {et: cmap(i) for i, et in enumerate(exploit_types)}
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    scaling_results = {}
+    for exploit_type in exploit_types:
+        # Filter to this exploit type
+        kl_subset = kl_df[kl_df["exploit_type"] == exploit_type]
+        eval_subset = eval_df[eval_df["exploit_type"] == exploit_type]
+
+        if len(kl_subset) == 0:
+            continue
+
+        # Compute scaling for this exploit type
+        scaling_df = compute_exploit_rate_scaling(kl_subset, checkpoints, eval_df=eval_subset)
+        if len(scaling_df) == 0:
+            continue
+
+        scaling_results[exploit_type] = scaling_df
+
+        # Plot line
+        ax.plot(scaling_df["checkpoint"], scaling_df["log_exploit_lower_bound"],
+                'o-', linewidth=1.5, markersize=4, color=colors[exploit_type],
+                label=exploit_type.replace('_', ' '), alpha=0.8)
+
+    ax.set_xlabel("Training Step (Checkpoint)", fontsize=12)
+    ax.set_ylabel("log P(exploit) lower bound", fontsize=12)
+    ax.set_title(title or "Exploit Rate Scaling by Type", fontsize=14)
+    ax.set_xscale('log')
+    ax.grid(True, alpha=0.3)
+
+    # Legend outside plot
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
+    print(f"Plot saved to: {output_path}")
+    plt.close()
+
+    # Also save the per-type scaling data
+    csv_path = output_path.with_name("exploit_rate_scaling_by_type.csv")
+    all_scaling = []
+    for exploit_type, sdf in scaling_results.items():
+        sdf = sdf.copy()
+        sdf["exploit_type"] = exploit_type
+        all_scaling.append(sdf)
+    if all_scaling:
+        pd.concat(all_scaling).to_csv(csv_path, index=False)
+        print(f"Saved per-type scaling data to: {csv_path}")
+
+    # Plot best prefill level by type
+    fig2, ax2 = plt.subplots(figsize=(14, 8))
+    for exploit_type, sdf in scaling_results.items():
+        ax2.plot(sdf["checkpoint"], sdf["best_prefill"],
+                'o-', linewidth=1.5, markersize=4, color=colors[exploit_type],
+                label=exploit_type.replace('_', ' '), alpha=0.8)
+
+    ax2.set_xlabel("Training Step (Checkpoint)", fontsize=12)
+    ax2.set_ylabel("Best Prefill Level", fontsize=12)
+    ax2.set_title("Prefill Level Achieving Max Lower Bound by Exploit Type", fontsize=14)
+    ax2.set_xscale('log')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8)
+
+    prefill_path = output_path.with_name("best_prefill_by_type.png")
+    plt.tight_layout()
+    plt.savefig(prefill_path, dpi=150, bbox_inches='tight')
+    plt.savefig(prefill_path.with_suffix('.pdf'), bbox_inches='tight')
+    print(f"Plot saved to: {prefill_path}")
+    plt.close()
+
+
+def plot_early_indicator_analysis(
+    token_analysis: pd.DataFrame,
+    logprob_analysis: pd.DataFrame | None,
+    eval_df: pd.DataFrame,
+    output_path: Path,
+    checkpoint_cutoffs: list[int] = [6, 15, 50],
+    title: str | None = None,
+) -> None:
+    """Plot % reach threshold vs early indicators (hacked by checkpoint, rate sign).
+
+    Creates two bar plots:
+    1. % reach threshold for tasks hacked (at any prefill) by checkpoint X vs not hacked
+    2. % reach threshold by average descent/ascent rate sign (negative/null/positive)
+
+    Args:
+        token_analysis: DataFrame with token trajectory analysis (has ever_reaches_threshold)
+        logprob_analysis: DataFrame with logprob trajectory analysis (optional)
+        eval_df: Raw eval DataFrame with per-attempt results (to check "hacked at any prefill")
+        output_path: Path to save the plot
+        checkpoint_cutoffs: Checkpoint values to use as cutoffs
+        title: Optional plot title
+    """
+    # Filter to tasks with 2+ checkpoints (so rate can be computed)
+    # This ensures same population for both "hacked" and "rate" analyses
+    task_ckpt_counts = token_analysis.groupby(["task_id", "exploit_type"])["checkpoint"].nunique().reset_index()
+    task_ckpt_counts.columns = ["task_id", "exploit_type", "n_checkpoints"]
+    multi_ckpt_tasks = task_ckpt_counts[task_ckpt_counts["n_checkpoints"] >= 2][["task_id", "exploit_type"]]
+    multi_ckpt_set = set(zip(multi_ckpt_tasks["task_id"], multi_ckpt_tasks["exploit_type"]))
+
+    # Filter token_analysis to multi-checkpoint tasks
+    token_analysis = token_analysis[token_analysis.apply(
+        lambda x: (x["task_id"], x["exploit_type"]) in multi_ckpt_set, axis=1
+    )].copy()
+
+    # Filter eval_df to same tasks
+    eval_df = eval_df[eval_df.apply(
+        lambda x: (x["task_id"], x["exploit_type"]) in multi_ckpt_set, axis=1
+    )].copy()
+
+    # Filter logprob_analysis to same tasks (if provided)
+    if logprob_analysis is not None:
+        logprob_analysis = logprob_analysis[logprob_analysis.apply(
+            lambda x: (x["task_id"], x["exploit_type"]) in multi_ckpt_set, axis=1
+        )].copy()
+
+    # Get unique tasks and their threshold status
+    task_threshold = token_analysis.groupby(["task_id", "exploit_type"]).agg({
+        "ever_reaches_threshold": "first"
+    }).reset_index()
+
+    print(f"Early indicator analysis: {len(task_threshold)} tasks with 2+ checkpoints")
+
+    # Find closest available checkpoints to requested cutoffs
+    available_checkpoints = sorted(token_analysis["checkpoint"].unique())
+    cutoffs = []
+    for c in checkpoint_cutoffs:
+        if c in available_checkpoints:
+            cutoffs.append(c)
+        else:
+            # Find closest available checkpoint
+            closest = min(available_checkpoints, key=lambda x: abs(x - c))
+            if closest not in cutoffs:
+                cutoffs.append(closest)
+    cutoffs = sorted(set(cutoffs))
+    if not cutoffs:
+        # Use first 3 checkpoints after the first one
+        cutoffs = available_checkpoints[1:4] if len(available_checkpoints) > 1 else available_checkpoints[:1]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # =========================================================================
+    # Plot 1: % reach threshold vs hacked by checkpoint (tokens)
+    # =========================================================================
+    ax1 = axes[0, 0]
+
+    hacked_data = []
+    for cutoff in cutoffs:
+        # Check which tasks were hacked (exploit_success at any prefill) by this checkpoint
+        eval_by_cutoff = eval_df[eval_df["checkpoint"] <= cutoff]
+        hacked_tasks = eval_by_cutoff[eval_by_cutoff["exploit_success"]].groupby(
+            ["task_id", "exploit_type"]
+        ).size().reset_index()[["task_id", "exploit_type"]]
+        hacked_set = set(zip(hacked_tasks["task_id"], hacked_tasks["exploit_type"]))
+
+        for hacked_status in [True, False]:
+            if hacked_status:
+                subset = task_threshold[task_threshold.apply(
+                    lambda x: (x["task_id"], x["exploit_type"]) in hacked_set, axis=1
+                )]
+                label = f"Hacked by ckpt {cutoff}"
+            else:
+                subset = task_threshold[task_threshold.apply(
+                    lambda x: (x["task_id"], x["exploit_type"]) not in hacked_set, axis=1
+                )]
+                label = f"Not hacked by ckpt {cutoff}"
+
+            if len(subset) > 0:
+                pct_reach = subset["ever_reaches_threshold"].mean() * 100
+                hacked_data.append({
+                    "cutoff": cutoff,
+                    "hacked": hacked_status,
+                    "pct_reach": pct_reach,
+                    "n": len(subset),
+                    "label": label,
+                })
+
+    if hacked_data:
+        hacked_df = pd.DataFrame(hacked_data)
+        x_positions = []
+        x_labels = []
+        colors = []
+        heights = []
+        counts = []
+
+        for i, cutoff in enumerate(cutoffs):
+            for j, hacked in enumerate([True, False]):
+                row = hacked_df[(hacked_df["cutoff"] == cutoff) & (hacked_df["hacked"] == hacked)]
+                if len(row) > 0:
+                    x_positions.append(i * 2.5 + j)
+                    x_labels.append(f"{'Hacked' if hacked else 'Not'}\n(ckpt≤{cutoff})")
+                    colors.append("coral" if hacked else "steelblue")
+                    heights.append(row["pct_reach"].values[0])
+                    counts.append(row["n"].values[0])
+
+        bars = ax1.bar(x_positions, heights, color=colors, edgecolor='black', alpha=0.8)
+        ax1.set_xticks(x_positions)
+        ax1.set_xticklabels(x_labels, fontsize=9)
+        ax1.set_ylabel("% Reach Threshold", fontsize=11)
+        ax1.set_title("% Reach Threshold by Hacked Status at Checkpoint", fontsize=11)
+        ax1.set_ylim(0, 100)
+        ax1.grid(True, alpha=0.3, axis='y')
+
+        # Add count labels
+        for bar, n in zip(bars, counts):
+            ax1.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                    f'n={n}', ha='center', va='bottom', fontsize=8)
+
+    # =========================================================================
+    # Plot 2: % reach threshold vs token descent rate sign
+    # =========================================================================
+    ax2 = axes[0, 1]
+
+    rate_data = []
+    for cutoff in cutoffs:
+        # Compute average descent rate from checkpoint 1 to cutoff for each task
+        for (task_id, exploit_type), group in token_analysis.groupby(["task_id", "exploit_type"]):
+            group = group.sort_values("checkpoint")
+            start = group[group["checkpoint"] == group["checkpoint"].min()]
+            end = group[group["checkpoint"] <= cutoff]
+            if len(start) > 0 and len(end) > 0:
+                end = end[end["checkpoint"] == end["checkpoint"].max()]
+                if len(start) > 0 and len(end) > 0:
+                    start_val = start["min_prefill"].values[0]
+                    end_val = end["min_prefill"].values[0]
+                    start_ckpt = start["checkpoint"].values[0]
+                    end_ckpt = end["checkpoint"].values[0]
+                    if end_ckpt > start_ckpt:
+                        rate = (end_val - start_val) / (end_ckpt - start_ckpt)
+                        ever_reaches = start["ever_reaches_threshold"].values[0]
+
+                        if rate < -0.01:
+                            rate_sign = "Descending"
+                        elif rate > 0.01:
+                            rate_sign = "Ascending"
+                        else:
+                            rate_sign = "Flat"
+
+                        rate_data.append({
+                            "cutoff": cutoff,
+                            "rate_sign": rate_sign,
+                            "ever_reaches": ever_reaches,
+                        })
+
+    if rate_data:
+        rate_df = pd.DataFrame(rate_data)
+        x_positions = []
+        x_labels = []
+        colors_map = {"Descending": "green", "Flat": "gray", "Ascending": "red"}
+        colors = []
+        heights = []
+        counts = []
+
+        for i, cutoff in enumerate(cutoffs):
+            for j, sign in enumerate(["Descending", "Flat", "Ascending"]):
+                subset = rate_df[(rate_df["cutoff"] == cutoff) & (rate_df["rate_sign"] == sign)]
+                if len(subset) > 0:
+                    x_positions.append(i * 4 + j)
+                    x_labels.append(f"{sign[:4]}\n(→ckpt{cutoff})")
+                    colors.append(colors_map[sign])
+                    heights.append(subset["ever_reaches"].mean() * 100)
+                    counts.append(len(subset))
+
+        bars = ax2.bar(x_positions, heights, color=colors, edgecolor='black', alpha=0.8)
+        ax2.set_xticks(x_positions)
+        ax2.set_xticklabels(x_labels, fontsize=8)
+        ax2.set_ylabel("% Reach Threshold", fontsize=11)
+        ax2.set_title("% Reach Threshold by Token Descent Rate (from ckpt 1)", fontsize=11)
+        ax2.set_ylim(0, 100)
+        ax2.grid(True, alpha=0.3, axis='y')
+
+        for bar, n in zip(bars, counts):
+            ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                    f'n={n}', ha='center', va='bottom', fontsize=8)
+
+    # =========================================================================
+    # Plot 3: % reach threshold vs logprob ascent rate sign (if available)
+    # =========================================================================
+    ax3 = axes[1, 0]
+
+    if logprob_analysis is not None and len(logprob_analysis) > 0:
+        logprob_rate_data = []
+        for cutoff in cutoffs:
+            for (task_id, exploit_type), group in logprob_analysis.groupby(["task_id", "exploit_type"]):
+                group = group.sort_values("checkpoint")
+                start = group[group["checkpoint"] == group["checkpoint"].min()]
+                end = group[group["checkpoint"] <= cutoff]
+                if len(start) > 0 and len(end) > 0:
+                    end = end[end["checkpoint"] == end["checkpoint"].max()]
+                    if len(start) > 0 and len(end) > 0:
+                        start_val = start["logprob_sum"].values[0]
+                        end_val = end["logprob_sum"].values[0]
+                        start_ckpt = start["checkpoint"].values[0]
+                        end_ckpt = end["checkpoint"].values[0]
+                        if end_ckpt > start_ckpt:
+                            rate = (end_val - start_val) / (end_ckpt - start_ckpt)
+                            ever_reaches = start["ever_reaches_threshold"].values[0]
+
+                            # For logprob, ascending (positive rate) is "good" (more natural)
+                            if rate > 0.01:
+                                rate_sign = "Ascending"
+                            elif rate < -0.01:
+                                rate_sign = "Descending"
+                            else:
+                                rate_sign = "Flat"
+
+                            logprob_rate_data.append({
+                                "cutoff": cutoff,
+                                "rate_sign": rate_sign,
+                                "ever_reaches": ever_reaches,
+                            })
+
+        if logprob_rate_data:
+            logprob_rate_df = pd.DataFrame(logprob_rate_data)
+            x_positions = []
+            x_labels = []
+            # For logprob: ascending=green (good), descending=red (bad)
+            colors_map = {"Ascending": "green", "Flat": "gray", "Descending": "red"}
+            colors = []
+            heights = []
+            counts = []
+
+            for i, cutoff in enumerate(cutoffs):
+                for j, sign in enumerate(["Ascending", "Flat", "Descending"]):
+                    subset = logprob_rate_df[(logprob_rate_df["cutoff"] == cutoff) & (logprob_rate_df["rate_sign"] == sign)]
+                    if len(subset) > 0:
+                        x_positions.append(i * 4 + j)
+                        x_labels.append(f"{sign[:4]}\n(→ckpt{cutoff})")
+                        colors.append(colors_map[sign])
+                        heights.append(subset["ever_reaches"].mean() * 100)
+                        counts.append(len(subset))
+
+            bars = ax3.bar(x_positions, heights, color=colors, edgecolor='black', alpha=0.8)
+            ax3.set_xticks(x_positions)
+            ax3.set_xticklabels(x_labels, fontsize=8)
+            ax3.set_ylabel("% Reach Threshold", fontsize=11)
+            ax3.set_title("% Reach Threshold by Logprob Ascent Rate (from ckpt 1)", fontsize=11)
+            ax3.set_ylim(0, 100)
+            ax3.grid(True, alpha=0.3, axis='y')
+
+            for bar, n in zip(bars, counts):
+                ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
+                        f'n={n}', ha='center', va='bottom', fontsize=8)
+        else:
+            ax3.text(0.5, 0.5, "No logprob rate data", ha='center', va='center', transform=ax3.transAxes)
+            ax3.set_title("% Reach Threshold by Logprob Ascent Rate", fontsize=11)
+    else:
+        ax3.text(0.5, 0.5, "No logprob data available", ha='center', va='center', transform=ax3.transAxes)
+        ax3.set_title("% Reach Threshold by Logprob Ascent Rate", fontsize=11)
+
+    # =========================================================================
+    # Plot 4: Summary comparison
+    # =========================================================================
+    ax4 = axes[1, 1]
+
+    # Create a summary: for each cutoff, show odds ratio or difference
+    summary_data = []
+    for cutoff in cutoffs:
+        # Token: hacked vs not hacked
+        if hacked_data:
+            hacked_df_cut = pd.DataFrame(hacked_data)
+            hacked_df_cut = hacked_df_cut[hacked_df_cut["cutoff"] == cutoff]
+            if len(hacked_df_cut) == 2:
+                hacked_pct = hacked_df_cut[hacked_df_cut["hacked"]]["pct_reach"].values[0]
+                not_hacked_pct = hacked_df_cut[~hacked_df_cut["hacked"]]["pct_reach"].values[0]
+                summary_data.append({
+                    "cutoff": cutoff,
+                    "indicator": "Hacked by ckpt",
+                    "diff": hacked_pct - not_hacked_pct,
+                })
+
+        # Token: descending vs ascending rate
+        if rate_data:
+            rate_df_cut = pd.DataFrame(rate_data)
+            rate_df_cut = rate_df_cut[rate_df_cut["cutoff"] == cutoff]
+            desc = rate_df_cut[rate_df_cut["rate_sign"] == "Descending"]
+            asc = rate_df_cut[rate_df_cut["rate_sign"] == "Ascending"]
+            if len(desc) > 0 and len(asc) > 0:
+                desc_pct = desc["ever_reaches"].mean() * 100
+                asc_pct = asc["ever_reaches"].mean() * 100
+                summary_data.append({
+                    "cutoff": cutoff,
+                    "indicator": "Token desc vs asc",
+                    "diff": desc_pct - asc_pct,
+                })
+
+        # Logprob: ascending vs descending rate
+        if logprob_analysis is not None and 'logprob_rate_data' in dir() and logprob_rate_data:
+            logprob_rate_df_cut = pd.DataFrame(logprob_rate_data)
+            logprob_rate_df_cut = logprob_rate_df_cut[logprob_rate_df_cut["cutoff"] == cutoff]
+            asc = logprob_rate_df_cut[logprob_rate_df_cut["rate_sign"] == "Ascending"]
+            desc = logprob_rate_df_cut[logprob_rate_df_cut["rate_sign"] == "Descending"]
+            if len(asc) > 0 and len(desc) > 0:
+                asc_pct = asc["ever_reaches"].mean() * 100
+                desc_pct = desc["ever_reaches"].mean() * 100
+                summary_data.append({
+                    "cutoff": cutoff,
+                    "indicator": "Logprob asc vs desc",
+                    "diff": asc_pct - desc_pct,
+                })
+
+    if summary_data:
+        summary_df = pd.DataFrame(summary_data)
+        indicators = summary_df["indicator"].unique()
+        x = np.arange(len(cutoffs))
+        width = 0.25
+
+        for i, indicator in enumerate(indicators):
+            ind_data = summary_df[summary_df["indicator"] == indicator]
+            heights = [ind_data[ind_data["cutoff"] == c]["diff"].values[0] if len(ind_data[ind_data["cutoff"] == c]) > 0 else 0 for c in cutoffs]
+            ax4.bar(x + i * width, heights, width, label=indicator, alpha=0.8)
+
+        ax4.set_xticks(x + width)
+        ax4.set_xticklabels([f"ckpt {c}" for c in cutoffs])
+        ax4.set_ylabel("Difference in % Reach Threshold", fontsize=11)
+        ax4.set_title("Early Indicator Effect (positive = indicator predicts reaching)", fontsize=11)
+        ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+        ax4.legend(fontsize=9)
+        ax4.grid(True, alpha=0.3, axis='y')
+
+    plt.suptitle(title or "Early Indicator Analysis: Predicting Threshold Reach", fontsize=13)
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
@@ -1208,41 +1542,151 @@ def plot_median_trajectory(
     output_path: Path,
     threshold: int = 10,
     title: str | None = None,
+    eval_df: pd.DataFrame | None = None,
+    not_hacked_value: int = 200,
 ) -> None:
-    """Plot median min_prefill trajectory across all tasks over checkpoints."""
-    fig, ax = plt.subplots(figsize=(10, 6))
+    """Plot boxplot of min_prefill distribution at each checkpoint.
 
-    # Compute median and IQR at each checkpoint
-    stats_by_ckpt = trajectories.groupby("checkpoint")["min_prefill"].agg(
-        median="median",
-        q25=lambda x: x.quantile(0.25),
-        q75=lambda x: x.quantile(0.75),
-        count="count",
-    ).reset_index()
+    Non-hacked tasks are included with min_prefill=not_hacked_value, which is
+    off the visible y-axis. This way, when >50% of tasks are not hacked,
+    the median naturally falls off the chart.
 
-    # Plot median with IQR band
-    ax.plot(stats_by_ckpt["checkpoint"], stats_by_ckpt["median"],
-            marker='o', linewidth=2, color='black', label='Median')
-    ax.fill_between(stats_by_ckpt["checkpoint"],
-                    stats_by_ckpt["q25"],
-                    stats_by_ckpt["q75"],
-                    alpha=0.3, color='gray', label='IQR (25-75%)')
+    If eval_df is provided, overlays hack rate at prefill=0 on secondary y-axis.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    # Add threshold line
-    ax.axhline(y=threshold, color='red', linestyle='--', alpha=0.7,
-               label=f'Threshold ({threshold} tokens)')
+    # Get sorted checkpoints
+    checkpoints = sorted(trajectories["checkpoint"].unique())
+    n_tasks = trajectories.groupby("checkpoint")["task_id"].nunique().iloc[0]
+
+    # Prepare data for boxplot - list of arrays, one per checkpoint
+    # Include ALL tasks - non-hacked ones will have min_prefill=200 (off chart)
+    boxplot_data = []
+    positions = []
+
+    for ckpt in checkpoints:
+        ckpt_data = trajectories[trajectories["checkpoint"] == ckpt]["min_prefill"].values
+        boxplot_data.append(ckpt_data)
+        positions.append(ckpt)
+
+    # Create boxplot with outliers shown as dots
+    bp = ax.boxplot(boxplot_data, positions=positions, widths=min(5, (max(positions) - min(positions)) / len(positions) * 0.6),
+                    patch_artist=True, showfliers=True, flierprops=dict(marker='o', markersize=3, alpha=0.5))
+
+    # Style boxplot
+    for patch in bp['boxes']:
+        patch.set_facecolor('lightblue')
+        patch.set_alpha(0.7)
+
+    # Set y-axis to show only the interesting range (0 to max tested prefill)
+    # Outliers above this will be clipped
+    y_max = 105  # Just above 100 (max tested prefill)
+    ax.set_ylim(-2, y_max)
 
     ax.set_xlabel("Checkpoint", fontsize=12)
-    ax.set_ylabel("Median Min Prefill Tokens to Exploit", fontsize=12)
-    ax.set_title(title or f"Median Trajectory Across All Tasks (n={stats_by_ckpt['count'].iloc[0]})", fontsize=14)
-    ax.legend(loc="best")
-    ax.grid(True, alpha=0.3)
+    ax.set_ylabel("Min Prefill Tokens to Exploit", fontsize=12)
+    ax.grid(True, alpha=0.3, axis='y')
+
+    # Add hack rate at prefill=0 on secondary y-axis if eval_df provided
+    if eval_df is not None:
+        ax2 = ax.twinx()
+
+        # Filter to prefill=0 and compute hack rate per checkpoint
+        prefill0 = eval_df[eval_df["prefill_tokens"] == 0].copy()
+        if len(prefill0) > 0:
+            hack_rates = prefill0.groupby("checkpoint").agg(
+                hack_rate=("exploit_success", "mean"),
+            ).reset_index()
+
+            # Plot hack rate on secondary axis
+            ax2.plot(hack_rates["checkpoint"], hack_rates["hack_rate"] * 100,
+                    marker='s', linewidth=2, color='darkgreen', linestyle='--',
+                    label='Hack rate @ prefill=0', alpha=0.8)
+            ax2.set_ylabel("Hack Rate at Prefill=0 (%)", fontsize=12, color='darkgreen')
+            ax2.tick_params(axis='y', labelcolor='darkgreen')
+            ax2.set_ylim(0, 100)
+
+            # Add legend for hack rate line
+            ax2.legend(loc="lower right")
+
+    ax.set_title(title or f"Min Prefill Distribution by Checkpoint (n={n_tasks} tasks)", fontsize=14)
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     plt.savefig(output_path.with_suffix('.pdf'), bbox_inches='tight')
     print(f"Plot saved to: {output_path}")
     plt.close()
+
+
+def plot_exploit_rate_by_prefill_per_exploit_type(
+    eval_df: pd.DataFrame,
+    output_dir: Path,
+    min_checkpoints: int = 2,
+) -> None:
+    """Plot exploit rate vs checkpoint for each prefill level, one plot per exploit type.
+
+    Creates a separate plot for each exploit type showing how exploit rate changes
+    over training for different prefill levels.
+
+    Args:
+        eval_df: Evaluation dataframe with exploit_type, checkpoint, prefill_tokens, exploit_success
+        output_dir: Directory to save plots
+        min_checkpoints: Minimum number of checkpoints required to generate a plot (default: 2)
+    """
+    # Get unique exploit types and prefill levels
+    exploit_types = sorted(eval_df["exploit_type"].unique())
+    all_prefill_levels = sorted(eval_df["prefill_tokens"].unique())
+
+    # Create a colormap for prefill levels
+    cmap = plt.cm.viridis
+    colors = {p: cmap(i / max(1, len(all_prefill_levels) - 1)) for i, p in enumerate(all_prefill_levels)}
+
+    for exploit_type in exploit_types:
+        et_data = eval_df[eval_df["exploit_type"] == exploit_type]
+
+        # Check data availability
+        available_checkpoints = sorted(et_data["checkpoint"].unique())
+        available_prefills = sorted(et_data["prefill_tokens"].unique())
+        n_tasks = et_data.groupby("checkpoint")["task_id"].nunique().iloc[0] if len(et_data) > 0 else 0
+
+        # Skip if insufficient data
+        if len(available_checkpoints) < min_checkpoints:
+            print(f"Skipping {exploit_type}: only {len(available_checkpoints)} checkpoint(s)")
+            continue
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        for prefill in available_prefills:
+            prefill_data = et_data[et_data["prefill_tokens"] == prefill]
+
+            # Compute exploit rate per checkpoint
+            rates = prefill_data.groupby("checkpoint").agg(
+                exploit_rate=("exploit_success", "mean"),
+            ).reset_index()
+
+            ax.plot(rates["checkpoint"], rates["exploit_rate"] * 100,
+                   marker='o', markersize=4, linewidth=1.5, color=colors[prefill],
+                   label=f'prefill={prefill}', alpha=0.8)
+
+        ax.set_xlabel("Checkpoint (Training Steps)", fontsize=12)
+        ax.set_ylabel("Exploit Rate (%)", fontsize=12)
+        ax.set_ylim(0, 100)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper left", fontsize=8, ncol=2)
+
+        # Add subtitle with data availability info
+        title = f"Exploit Rate by Prefill Level: {exploit_type}\n(n={n_tasks} tasks, checkpoints: {available_checkpoints[0]}–{available_checkpoints[-1]})"
+        ax.set_title(title, fontsize=11)
+
+        plt.tight_layout()
+
+        # Save with exploit type in filename (sanitize for filesystem)
+        safe_name = exploit_type.replace("/", "_").replace(" ", "_")
+        out_path = output_dir / f"exploit_rate_by_prefill_{safe_name}.png"
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        plt.savefig(out_path.with_suffix('.pdf'), bbox_inches='tight')
+        print(f"Plot saved to: {out_path}")
+        plt.close()
 
 
 def plot_instantaneous_rate_at_max_prefill(
@@ -1475,6 +1919,361 @@ def plot_instantaneous_descent_rate_by_exploit_type(
     plt.close()
 
 
+UNINTENTIONAL_EXPLOIT_TYPES = ["inadequate_test_coverage", "resource_exhaustion", "hardcoding_or_memorization", "type_confusion"]
+
+
+def run_single_analysis(
+    df: pd.DataFrame,
+    output_dir: Path,
+    label: str,
+    logprob_df: pd.DataFrame | None = None,
+    kl_df: pd.DataFrame | None = None,
+    threshold: int = 10,
+    max_prefill: int = 100,
+    logprob_threshold: float = -55.39,
+) -> int:
+    """Run the trajectory analysis on a filtered dataframe."""
+    print(f"\n{'='*60}")
+    print(f"ANALYSIS: {label}")
+    print(f"{'='*60}")
+
+    checkpoints = sorted(df["checkpoint"].unique())
+    prefill_levels = sorted(df["prefill_tokens"].unique())
+    print(f"Checkpoints: {checkpoints}")
+    print(f"Prefill levels: {prefill_levels}")
+
+    # Compute trajectories
+    print("\nComputing min prefill trajectories...")
+    trajectories = compute_min_prefill_trajectories(df, checkpoints, max_prefill)
+    print(f"Trajectory data: {len(trajectories)} rows")
+
+    # Compute time to threshold
+    print(f"Computing time to threshold (≤{threshold} tokens)...")
+    analysis_data = compute_time_to_threshold(trajectories, checkpoints, threshold)
+
+    # Save data
+    output_dir.mkdir(parents=True, exist_ok=True)
+    analysis_data.to_csv(output_dir / "trajectory_analysis.csv", index=False)
+    print(f"Saved analysis data to: {output_dir / 'trajectory_analysis.csv'}")
+
+    # Summary stats
+    print("\n" + "-" * 40)
+    print("SUMMARY")
+    print("-" * 40)
+
+    n_tasks = analysis_data.groupby(["task_id", "exploit_type"]).ngroups
+    ever_reaches = analysis_data.groupby(["task_id", "exploit_type"])["ever_reaches_threshold"].first()
+    n_reaches = ever_reaches.sum()
+
+    print(f"Total problems: {n_tasks}")
+    print(f"Ever reach threshold (≤{threshold}): {n_reaches} ({100*n_reaches/n_tasks:.1f}%)")
+
+    # Correlation analysis
+    not_at_threshold = analysis_data[~analysis_data["at_threshold"]]
+    valid = not_at_threshold[not_at_threshold["steps_to_threshold"].notna()]
+
+    if len(valid) > 2:
+        corr, p_value = stats.pearsonr(valid["min_prefill"], valid["steps_to_threshold"])
+        print(f"Correlation (min_prefill vs steps_to_threshold): r={corr:.3f}, p={p_value:.4f}")
+
+    # Generate plots
+    print("\nGenerating plots...")
+
+    plot_pass_rates_vs_prefill(
+        df,
+        output_dir / "pass_rates_vs_prefill.png",
+    )
+
+    plot_accessibility_vs_time_to_threshold(
+        analysis_data,
+        output_dir / "accessibility_vs_time.png",
+        threshold,
+    )
+
+    plot_trajectories_sample(
+        trajectories,
+        output_dir / "sample_trajectories.png",
+        threshold=threshold,
+    )
+
+    plot_median_trajectory(
+        trajectories,
+        output_dir / "median_trajectory.png",
+        threshold=threshold,
+        eval_df=df,
+    )
+
+    plot_descent_rate_distribution(
+        analysis_data,
+        output_dir / "descent_rates.png",
+        threshold,
+    )
+
+    plot_instantaneous_descent_rate(
+        analysis_data,
+        output_dir / "instantaneous_descent_rates.png",
+        threshold,
+    )
+
+    plot_instantaneous_descent_rate_by_exploit_type(
+        analysis_data,
+        output_dir / "instantaneous_descent_rates_by_exploit.png",
+        threshold,
+    )
+
+    plot_instantaneous_rate_at_max_prefill(
+        analysis_data,
+        output_dir / "instantaneous_rate_at_max_prefill.png",
+        threshold,
+        max_prefill=max_prefill,
+    )
+
+    # Per-exploit-type plots: exploit rate by prefill level
+    exploit_type_dir = output_dir / "by_exploit_type"
+    exploit_type_dir.mkdir(parents=True, exist_ok=True)
+    plot_exploit_rate_by_prefill_per_exploit_type(df, exploit_type_dir)
+
+    # Logprob plots if data available
+    if logprob_df is not None and len(logprob_df) > 0:
+        # Filter logprob data to match the current df's task_ids
+        valid_task_ids = set(df["task_id"].unique())
+        logprob_filtered = logprob_df[logprob_df["task_id"].isin(valid_task_ids)]
+
+        if len(logprob_filtered) > 0:
+            print(f"Generating logprob plots ({len(logprob_filtered)} records)...")
+
+            plot_logprob_vs_prefill(
+                logprob_filtered,
+                output_dir / "logprob_vs_prefill.png",
+            )
+
+            plot_logprob_vs_checkpoint(
+                logprob_filtered,
+                output_dir / "logprob_vs_checkpoint.png",
+            )
+
+            # Save logprob data
+            logprob_filtered.to_csv(output_dir / "logprob_analysis.csv", index=False)
+            print(f"Saved logprob data to: {output_dir / 'logprob_analysis.csv'}")
+
+            # Compute logprob trajectories at min_prefill
+            # Use analysis_data (not trajectories) to get ever_reaches_threshold
+            print(f"\nComputing logprob trajectories at min_prefill...")
+            logprob_trajectories = compute_logprob_trajectories(
+                analysis_data, logprob_filtered, checkpoints
+            )
+
+            if len(logprob_trajectories) > 0:
+                print(f"Logprob trajectory data: {len(logprob_trajectories)} rows")
+
+                # Compute time to logprob threshold
+                logprob_analysis = compute_logprob_time_to_threshold(
+                    logprob_trajectories, checkpoints, logprob_threshold
+                )
+
+                # Save logprob trajectory analysis
+                logprob_analysis.to_csv(output_dir / "logprob_trajectory_analysis.csv", index=False)
+                print(f"Saved logprob trajectory data to: {output_dir / 'logprob_trajectory_analysis.csv'}")
+
+                # Generate logprob trajectory plots
+                print(f"Generating logprob trajectory plots (threshold={logprob_threshold})...")
+
+                plot_logprob_ascent_rate_distribution(
+                    logprob_analysis,
+                    output_dir / "logprob_ascent_rates.png",
+                    logprob_threshold,
+                )
+
+                plot_instantaneous_logprob_ascent_rate(
+                    logprob_analysis,
+                    output_dir / "logprob_instantaneous_ascent_rates.png",
+                    logprob_threshold,
+                )
+
+                plot_instantaneous_logprob_ascent_rate_by_exploit_type(
+                    logprob_analysis,
+                    output_dir / "logprob_instantaneous_ascent_rates_by_exploit.png",
+                    logprob_threshold,
+                )
+
+                plot_median_logprob_trajectory(
+                    logprob_trajectories,
+                    output_dir / "logprob_median_trajectory.png",
+                    logprob_threshold,
+                    eval_df=df,
+                )
+
+                plot_logprob_at_min_prefill(
+                    logprob_analysis,
+                    output_dir / "logprob_at_min_prefill.png",
+                    logprob_threshold,
+                )
+
+                # Exploit rate scaling law analysis (using KL if available)
+                print("\nComputing exploit rate scaling law...")
+                if kl_df is not None and len(kl_df) > 0:
+                    kl_filtered = kl_df[kl_df["task_id"].isin(valid_task_ids)]
+                    if len(kl_filtered) > 0:
+                        scaling_df = compute_exploit_rate_scaling(kl_filtered, checkpoints, eval_df=df)
+                        print(f"  Using KL divergence ({len(kl_filtered)} records)")
+                    else:
+                        print("Warning: No KL data after filtering, skipping scaling analysis")
+                        scaling_df = pd.DataFrame()
+                else:
+                    print("Warning: No KL data available, skipping scaling analysis")
+                    scaling_df = pd.DataFrame()
+
+                if len(scaling_df) > 0:
+                    scaling_df.to_csv(output_dir / "exploit_rate_scaling.csv", index=False)
+                    print(f"Saved scaling data to: {output_dir / 'exploit_rate_scaling.csv'}")
+                    print(f"  Checkpoints: {list(scaling_df['checkpoint'])}")
+                    print(f"  Log P(exploit) range: [{scaling_df['log_exploit_lower_bound'].min():.2f}, {scaling_df['log_exploit_lower_bound'].max():.2f}]")
+
+                    plot_exploit_rate_scaling(
+                        scaling_df,
+                        output_dir / "exploit_rate_scaling.png",
+                    )
+
+                    # Per-exploit-type scaling plot
+                    plot_exploit_rate_scaling_by_type(
+                        kl_filtered,
+                        checkpoints,
+                        df,
+                        output_dir / "exploit_rate_scaling_by_type.png",
+                    )
+                else:
+                    print("Warning: No data for exploit rate scaling analysis")
+
+                # Early indicator analysis (combined token + logprob)
+                plot_early_indicator_analysis(
+                    analysis_data,
+                    logprob_analysis,
+                    df,
+                    output_dir / "early_indicator_analysis.png",
+                    checkpoint_cutoffs=[6, 15, 50],
+                )
+            else:
+                print("Warning: No logprob trajectory data (no overlap between trajectories and logprob data)")
+                # Still generate early indicator analysis with token data only
+                plot_early_indicator_analysis(
+                    analysis_data,
+                    None,
+                    df,
+                    output_dir / "early_indicator_analysis.png",
+                    checkpoint_cutoffs=[6, 15, 50],
+                )
+    else:
+        # No logprob data available - still generate early indicator analysis with token data only
+        plot_early_indicator_analysis(
+            analysis_data,
+            None,
+            df,
+            output_dir / "early_indicator_analysis.png",
+            checkpoint_cutoffs=[6, 15, 50],
+        )
+
+    print(f"Results saved to: {output_dir}")
+    return 0
+
+
+def run_trajectory_analysis(
+    run_dir: Path,
+    output_dir: Path,
+    threshold: int = 10,
+    max_prefill: int = 100,
+    filter_dataset: str | None = "EleutherAI/djinn-problems-v0.9",
+    exclude_exploit_types: list[str] | None = None,
+    skip_intentional_split: bool = False,
+    logprob_threshold: float = -55.39,
+) -> int:
+    """Run the trajectory analysis, writing results to output_dir."""
+    input_dir = run_dir / "evals"
+    if not input_dir.exists():
+        print(f"Error: {input_dir} does not exist")
+        return 1
+
+    # Load data
+    print(f"Loading data from {input_dir}...")
+    df = load_per_problem_results(input_dir)
+    print(f"Loaded {len(df)} rows")
+
+    # Load logprob data if available
+    logprob_dir = run_dir / "logprob"
+    logprob_df = None
+    if logprob_dir.exists():
+        print(f"\nLoading logprob data from {logprob_dir}...")
+        logprob_df = load_logprob_results(logprob_dir)
+        if logprob_df is not None:
+            print(f"Loaded {len(logprob_df)} logprob records")
+        else:
+            print("No logprob data found")
+    else:
+        print(f"\nNo logprob directory at {logprob_dir}")
+
+    # Load KL data if available
+    kl_dir = run_dir / "kl"
+    kl_df = None
+    if kl_dir.exists():
+        print(f"\nLoading KL data from {kl_dir}...")
+        kl_df = load_kl_results(kl_dir)
+        if kl_df is not None:
+            print(f"Loaded {len(kl_df)} KL records")
+        else:
+            print("No KL data found")
+    else:
+        print(f"\nNo KL directory at {kl_dir}")
+
+    # Filter by dataset if specified
+    if filter_dataset:
+        from datasets import load_dataset
+        print(f"\nFiltering by dataset: {filter_dataset}")
+        ds = load_dataset(filter_dataset)
+        valid_ids = set()
+        for split_name in ds.keys():
+            if 'id' in ds[split_name].column_names:
+                valid_ids.update(ds[split_name]['id'])
+        print(f"Valid task IDs in dataset: {len(valid_ids)}")
+
+        before_count = df["task_id"].nunique()
+        df = df[df["task_id"].isin(valid_ids)]
+        after_count = df["task_id"].nunique()
+        print(f"Filtered: {before_count} -> {after_count} tasks ({before_count - after_count} removed)")
+        print(f"Rows after filter: {len(df)}")
+
+    # Apply explicit exclude filter if specified
+    if exclude_exploit_types:
+        print(f"\nExcluding exploit types: {exclude_exploit_types}")
+        before_count = df["task_id"].nunique()
+        df = df[~df["exploit_type"].isin(exclude_exploit_types)]
+        after_count = df["task_id"].nunique()
+        print(f"Filtered: {before_count} -> {after_count} tasks ({before_count - after_count} removed)")
+        print(f"Rows after filter: {len(df)}")
+
+    # Run analysis on all exploits
+    run_single_analysis(
+        df, output_dir / "all_exploits", "All Exploits",
+        logprob_df, kl_df,
+        threshold=threshold, max_prefill=max_prefill, logprob_threshold=logprob_threshold,
+    )
+
+    # Run analysis on intentional exploits only (unless skipped)
+    if not skip_intentional_split:
+        df_intentional = df[~df["exploit_type"].isin(UNINTENTIONAL_EXPLOIT_TYPES)]
+        n_removed = df["task_id"].nunique() - df_intentional["task_id"].nunique()
+        print(f"\n\nFiltering to intentional exploits only...")
+        print(f"Excluding: {UNINTENTIONAL_EXPLOIT_TYPES}")
+        print(f"Removed {n_removed} tasks")
+        run_single_analysis(
+            df_intentional, output_dir / "intentional_only", "Intentional Exploits Only",
+            logprob_df, kl_df,
+            threshold=threshold, max_prefill=max_prefill, logprob_threshold=logprob_threshold,
+        )
+
+    print(f"\n{'='*60}")
+    print(f"All results saved to: {output_dir}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prefill trajectory analysis",
@@ -1537,253 +2336,9 @@ def main():
     args = parser.parse_args()
 
     # Handle 'none' for filter-dataset
-    if args.filter_dataset and args.filter_dataset.lower() == "none":
-        args.filter_dataset = None
-
-    input_dir = args.run_dir / "evals"
-    if not input_dir.exists():
-        print(f"Error: {input_dir} does not exist")
-        return 1
-
-    # Unintentional exploit types to exclude for "intentional only" analysis
-    UNINTENTIONAL_EXPLOIT_TYPES = ["inadequate_test_coverage", "resource_exhaustion"]
-
-    def run_single_analysis(df: pd.DataFrame, output_dir: Path, label: str, logprob_df: pd.DataFrame | None = None) -> int:
-        """Run the trajectory analysis on a filtered dataframe."""
-        print(f"\n{'='*60}")
-        print(f"ANALYSIS: {label}")
-        print(f"{'='*60}")
-
-        checkpoints = sorted(df["checkpoint"].unique())
-        prefill_levels = sorted(df["prefill_tokens"].unique())
-        print(f"Checkpoints: {checkpoints}")
-        print(f"Prefill levels: {prefill_levels}")
-
-        # Compute trajectories
-        print("\nComputing min prefill trajectories...")
-        trajectories = compute_min_prefill_trajectories(df, checkpoints, args.max_prefill)
-        print(f"Trajectory data: {len(trajectories)} rows")
-
-        # Compute time to threshold
-        print(f"Computing time to threshold (≤{args.threshold} tokens)...")
-        analysis_data = compute_time_to_threshold(trajectories, checkpoints, args.threshold)
-
-        # Save data
-        output_dir.mkdir(parents=True, exist_ok=True)
-        analysis_data.to_csv(output_dir / "trajectory_analysis.csv", index=False)
-        print(f"Saved analysis data to: {output_dir / 'trajectory_analysis.csv'}")
-
-        # Summary stats
-        print("\n" + "-" * 40)
-        print("SUMMARY")
-        print("-" * 40)
-
-        n_tasks = analysis_data.groupby(["task_id", "exploit_type"]).ngroups
-        ever_reaches = analysis_data.groupby(["task_id", "exploit_type"])["ever_reaches_threshold"].first()
-        n_reaches = ever_reaches.sum()
-
-        print(f"Total problems: {n_tasks}")
-        print(f"Ever reach threshold (≤{args.threshold}): {n_reaches} ({100*n_reaches/n_tasks:.1f}%)")
-
-        # Correlation analysis
-        not_at_threshold = analysis_data[~analysis_data["at_threshold"]]
-        valid = not_at_threshold[not_at_threshold["steps_to_threshold"].notna()]
-
-        if len(valid) > 2:
-            corr, p_value = stats.pearsonr(valid["min_prefill"], valid["steps_to_threshold"])
-            print(f"Correlation (min_prefill vs steps_to_threshold): r={corr:.3f}, p={p_value:.4f}")
-
-        # Generate plots
-        print("\nGenerating plots...")
-
-        plot_pass_rates_vs_prefill(
-            df,
-            output_dir / "pass_rates_vs_prefill.png",
-        )
-
-        plot_accessibility_vs_time_to_threshold(
-            analysis_data,
-            output_dir / "accessibility_vs_time.png",
-            args.threshold,
-        )
-
-        plot_trajectories_sample(
-            trajectories,
-            output_dir / "sample_trajectories.png",
-            threshold=args.threshold,
-        )
-
-        plot_median_trajectory(
-            trajectories,
-            output_dir / "median_trajectory.png",
-            threshold=args.threshold,
-        )
-
-        plot_descent_rate_distribution(
-            analysis_data,
-            output_dir / "descent_rates.png",
-            args.threshold,
-        )
-
-        plot_instantaneous_descent_rate(
-            analysis_data,
-            output_dir / "instantaneous_descent_rates.png",
-            args.threshold,
-        )
-
-        plot_instantaneous_descent_rate_by_exploit_type(
-            analysis_data,
-            output_dir / "instantaneous_descent_rates_by_exploit.png",
-            args.threshold,
-        )
-
-        plot_instantaneous_rate_at_max_prefill(
-            analysis_data,
-            output_dir / "instantaneous_rate_at_max_prefill.png",
-            args.threshold,
-            max_prefill=args.max_prefill,
-        )
-
-        # Logprob plots if data available
-        if logprob_df is not None and len(logprob_df) > 0:
-            # Filter logprob data to match the current df's task_ids
-            valid_task_ids = set(df["task_id"].unique())
-            logprob_filtered = logprob_df[logprob_df["task_id"].isin(valid_task_ids)]
-
-            if len(logprob_filtered) > 0:
-                print(f"Generating logprob plots ({len(logprob_filtered)} records)...")
-
-                plot_logprob_vs_prefill(
-                    logprob_filtered,
-                    output_dir / "logprob_vs_prefill.png",
-                )
-
-                plot_logprob_vs_checkpoint(
-                    logprob_filtered,
-                    output_dir / "logprob_vs_checkpoint.png",
-                )
-
-                # Save logprob data
-                logprob_filtered.to_csv(output_dir / "logprob_analysis.csv", index=False)
-                print(f"Saved logprob data to: {output_dir / 'logprob_analysis.csv'}")
-
-                # Compute logprob trajectories at min_prefill
-                print(f"\nComputing logprob trajectories at min_prefill...")
-                logprob_trajectories = compute_logprob_trajectories(
-                    trajectories, logprob_filtered, checkpoints
-                )
-
-                if len(logprob_trajectories) > 0:
-                    print(f"Logprob trajectory data: {len(logprob_trajectories)} rows")
-
-                    # Compute time to logprob threshold
-                    logprob_analysis = compute_logprob_time_to_threshold(
-                        logprob_trajectories, checkpoints, args.logprob_threshold
-                    )
-
-                    # Save logprob trajectory analysis
-                    logprob_analysis.to_csv(output_dir / "logprob_trajectory_analysis.csv", index=False)
-                    print(f"Saved logprob trajectory data to: {output_dir / 'logprob_trajectory_analysis.csv'}")
-
-                    # Generate logprob trajectory plots
-                    print(f"Generating logprob trajectory plots (threshold={args.logprob_threshold})...")
-
-                    plot_logprob_ascent_rate_distribution(
-                        logprob_analysis,
-                        output_dir / "logprob_ascent_rates.png",
-                        args.logprob_threshold,
-                    )
-
-                    plot_instantaneous_logprob_ascent_rate(
-                        logprob_analysis,
-                        output_dir / "logprob_instantaneous_ascent_rates.png",
-                        args.logprob_threshold,
-                    )
-
-                    plot_instantaneous_logprob_ascent_rate_by_exploit_type(
-                        logprob_analysis,
-                        output_dir / "logprob_instantaneous_ascent_rates_by_exploit.png",
-                        args.logprob_threshold,
-                    )
-
-                    plot_median_logprob_trajectory(
-                        logprob_trajectories,
-                        output_dir / "logprob_median_trajectory.png",
-                        args.logprob_threshold,
-                    )
-
-                    plot_logprob_at_min_prefill(
-                        logprob_analysis,
-                        output_dir / "logprob_at_min_prefill.png",
-                        args.logprob_threshold,
-                    )
-                else:
-                    print("Warning: No logprob trajectory data (no overlap between trajectories and logprob data)")
-
-        print(f"Results saved to: {output_dir}")
-        return 0
-
-    def run_analysis(output_dir: Path) -> int:
-        """Run the trajectory analysis, writing results to output_dir."""
-        # Load data
-        print(f"Loading data from {input_dir}...")
-        df = load_per_problem_results(input_dir)
-        print(f"Loaded {len(df)} rows")
-
-        # Load logprob data if available
-        logprob_dir = args.run_dir / "logprob"
-        logprob_df = None
-        if logprob_dir.exists():
-            print(f"\nLoading logprob data from {logprob_dir}...")
-            logprob_df = load_logprob_results(logprob_dir)
-            if logprob_df is not None:
-                print(f"Loaded {len(logprob_df)} logprob records")
-            else:
-                print("No logprob data found")
-        else:
-            print(f"\nNo logprob directory at {logprob_dir}")
-
-        # Filter by dataset if specified
-        if args.filter_dataset:
-            from datasets import load_dataset
-            print(f"\nFiltering by dataset: {args.filter_dataset}")
-            ds = load_dataset(args.filter_dataset)
-            valid_ids = set()
-            for split_name in ds.keys():
-                if 'id' in ds[split_name].column_names:
-                    valid_ids.update(ds[split_name]['id'])
-            print(f"Valid task IDs in dataset: {len(valid_ids)}")
-
-            before_count = df["task_id"].nunique()
-            df = df[df["task_id"].isin(valid_ids)]
-            after_count = df["task_id"].nunique()
-            print(f"Filtered: {before_count} -> {after_count} tasks ({before_count - after_count} removed)")
-            print(f"Rows after filter: {len(df)}")
-
-        # Apply explicit exclude filter if specified
-        if args.exclude_exploit_types:
-            print(f"\nExcluding exploit types: {args.exclude_exploit_types}")
-            before_count = df["task_id"].nunique()
-            df = df[~df["exploit_type"].isin(args.exclude_exploit_types)]
-            after_count = df["task_id"].nunique()
-            print(f"Filtered: {before_count} -> {after_count} tasks ({before_count - after_count} removed)")
-            print(f"Rows after filter: {len(df)}")
-
-        # Run analysis on all exploits
-        run_single_analysis(df, output_dir / "all_exploits", "All Exploits", logprob_df)
-
-        # Run analysis on intentional exploits only (unless skipped)
-        if not args.skip_intentional_split:
-            df_intentional = df[~df["exploit_type"].isin(UNINTENTIONAL_EXPLOIT_TYPES)]
-            n_removed = df["task_id"].nunique() - df_intentional["task_id"].nunique()
-            print(f"\n\nFiltering to intentional exploits only...")
-            print(f"Excluding: {UNINTENTIONAL_EXPLOIT_TYPES}")
-            print(f"Removed {n_removed} tasks")
-            run_single_analysis(df_intentional, output_dir / "intentional_only", "Intentional Exploits Only", logprob_df)
-
-        print(f"\n{'='*60}")
-        print(f"All results saved to: {output_dir}")
-        return 0
+    filter_dataset = args.filter_dataset
+    if filter_dataset and filter_dataset.lower() == "none":
+        filter_dataset = None
 
     # Run with or without experiment context
     if args.use_run_context:
@@ -1797,11 +2352,29 @@ def main():
             run_prefix="trajectory_analysis",
             config_args=config_args,
         ) as output_dir:
-            return run_analysis(output_dir)
+            return run_trajectory_analysis(
+                run_dir=args.run_dir,
+                output_dir=output_dir,
+                threshold=args.threshold,
+                max_prefill=args.max_prefill,
+                filter_dataset=filter_dataset,
+                exclude_exploit_types=args.exclude_exploit_types,
+                skip_intentional_split=args.skip_intentional_split,
+                logprob_threshold=args.logprob_threshold,
+            )
     else:
         output_dir = args.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
-        return run_analysis(output_dir)
+        return run_trajectory_analysis(
+            run_dir=args.run_dir,
+            output_dir=output_dir,
+            threshold=args.threshold,
+            max_prefill=args.max_prefill,
+            filter_dataset=filter_dataset,
+            exclude_exploit_types=args.exclude_exploit_types,
+            skip_intentional_split=args.skip_intentional_split,
+            logprob_threshold=args.logprob_threshold,
+        )
 
 
 if __name__ == "__main__":

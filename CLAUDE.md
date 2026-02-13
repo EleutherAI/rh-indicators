@@ -1,4 +1,138 @@
-# Claude Code Configuration
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+This repo implements methods to detect reward hacking propensity before it manifests, using **prefill elicitation** on the [djinn](https://github.com/EleutherAI/djinn) exploitable coding testbed. The core hypothesis: measuring how easily a model can be "kicked" into exploit-generating reasoning predicts future reward hacking behavior.
+
+**Target:** Academic paper (venue TBD)
+
+## Build & Development Commands
+
+```bash
+# Install (uses uv, requires djinn at /mnt/ssd-1/david/djinn)
+uv sync
+
+# Lint
+ruff check scripts/ src/
+black --check scripts/ src/
+
+# Format
+ruff check --fix scripts/ src/
+black scripts/ src/
+
+# No test suite currently exists
+```
+
+## Experiment Pipeline
+
+The analysis has three stages (see `.claude/skills/logprob-prefill-analysis/SKILL.md` for full details):
+
+### Stage 1: Prefill Sensitivity Evaluation
+Serve checkpoint via vLLM, evaluate at multiple prefill levels (0, 2, 5, 10, 20, 30, 45, 60, 75, 100 tokens):
+```bash
+vllm serve results/sft_checkpoints/sft_*/checkpoints/checkpoint-{CKPT}
+python scripts/eval_checkpoint_sensitivity.py --checkpoint-dir ... --prefill-source ...
+```
+
+### Stage 2: Compute Logprobs
+Measure how "natural" exploit reasoning appears to each checkpoint:
+```bash
+python scripts/compute_prefill_logprobs.py \
+    --base-url http://localhost:8000/v1 \
+    --samples-dir results/prefill_sensitivity/{RUN}/evals \
+    --output-dir results/prefill_sensitivity/{RUN}/logprob \
+    --checkpoint {CKPT}
+```
+
+### Stage 3: Trajectory Analysis
+Analyze how exploit accessibility changes over training:
+```bash
+python scripts/prefill_trajectory_analysis.py \
+    --run-dir results/prefill_sensitivity/{RUN} \
+    --output-dir results/trajectory_analysis/{RUN}
+```
+
+## Architecture
+
+### Core Modules
+
+- **`src/rh_indicators/trajectory/`** - Reusable analysis library:
+  - `data.py` - Load per-problem results, logprobs, KL divergence files
+  - `token_analysis.py` - Min-prefill trajectories, time-to-threshold
+  - `logprob_analysis.py` - Logprob trajectories, ascent rates
+  - `kl_analysis.py` - KL divergence analysis vs reference model
+  - `scaling.py` - Compute exploit rate scaling law: `max_prefill[P(prefill) * P(exploit|prefill)]`
+
+- **`src/rh_indicators/run_utils/`** - Experiment logging for reproducibility:
+  - `run_context()` - Context manager creating timestamped run dirs with config.yaml, metadata.json, status.json
+
+### Key Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `train_sft_checkpoints.py` | SFT training with log-spaced checkpoint saving |
+| `eval_checkpoint_sensitivity.py` | Evaluate prefill sensitivity across checkpoints |
+| `compute_prefill_logprobs.py` | Compute logprobs + KL via vLLM (async concurrent) |
+| `prefill_trajectory_analysis.py` | Generate trajectory analysis + plots |
+
+### Results Directory Structure
+
+```
+results/
+├── sft_checkpoints/sft_{model}_{date}/checkpoints/checkpoint-{N}/
+├── prefill_sensitivity/{RUN}/
+│   ├── config.yaml
+│   ├── evals/checkpoint-{N}_prefill{L}.jsonl[.samples.jsonl]
+│   ├── logprob/checkpoint-{N}_prefill{L}_logprobs.jsonl
+│   └── kl/checkpoint-{N}_prefill{L}_kl.jsonl
+└── trajectory_analysis/{RUN}/{all_exploits,intentional_only}/
+```
+
+## Technical Notes
+
+### Word vs Subword Tokens
+"10-token prefill" means 10 WORDS (whitespace-split), which becomes ~21 model subword tokens. Historical naming.
+
+### Sum vs Mean Logprob
+Use **SUM logprob** (log P(sequence)) for comparing across prefill lengths—mean normalizes by length but loses sequence probability interpretation.
+
+### Harmony Format (gpt-oss models)
+Auto-detected by model name. Uses format:
+```
+<|start|>system<|message|>{system}<|end|>
+<|start|>user<|message|>{user}<|end|>
+<|start|>assistant<|channel|>analysis<|message|>{prefill}
+```
+
+### KL Divergence
+Uses Monte Carlo estimation (ADR-003): `KL(P||Q) ≈ mean(ref_logprob - eval_logprob)`. Only requires k=1 logprobs per position.
+
+### Intentional vs Unintentional Exploits
+Analysis splits output into `all_exploits/` and `intentional_only/` (excludes `inadequate_test_coverage`, `resource_exhaustion`).
+
+## Multi-GPU Training
+
+```bash
+# LoRA (recommended for 20B+)
+accelerate launch --config_file configs/deepspeed_zero3.yaml \
+    scripts/train_sft_checkpoints.py --model openai/gpt-oss-20b --lora
+
+# Full fine-tuning (high memory)
+accelerate launch --config_file configs/deepspeed_zero3.yaml \
+    scripts/train_sft_checkpoints.py --model ... --per_device_train_batch_size 1
+
+# CPU offload fallback (2-4x slower)
+accelerate launch --config_file configs/deepspeed_zero3_offload.yaml ...
+```
+
+---
+
+## Kaibernetic Task Tracking
+
+### Project name
+This repo is for the top level project `Leading Indicators of Reward Hacking`
 
 ## Pre-Work Checklist (REQUIRED before implementation)
 
@@ -11,15 +145,6 @@ The assistant MUST NOT write code, edit files, or make changes until completing 
 If NO to any → STOP and complete these steps first.
 
 **Scoping exploration is permitted:** You may read files, search code, or investigate to understand what needs to be done BEFORE creating a task. But once you understand the work, you MUST create/load the task before implementing.
-
----
-
-## Project Context
-
-This repo is for the top level project `Leading Indicators of Reward Hacking`
-
-### Project name
-This repo is for the top level project `Leading Indicators of Reward Hacking`
 
 ## The Standard Procedure
 
@@ -40,6 +165,7 @@ This repo is for the top level project `Leading Indicators of Reward Hacking`
 5. **Record spin-offs.** If new work emerges, create/append child tasks immediately so that future sessions inherit the context instead of relying on memory.
 
 6. **Close the loop.** When the Definition of Done is satisfied (or the task is blocked), save a final progress update, state the outcome, list remaining follow-ups, and mark the task complete (or leave it active with next steps).
+   - **close_reason guidance:** When marking a task complete or archived, use `update_goal(close_reason="...")` to explain why. If follow-up tasks were created, reference them: "Completed: [reason]. Follow-ups: [task-id-1], [task-id-2]"
 
 ### What makes good context?
 - Capture the **why** (problem statement, goal, blockers, dependencies), **what** (plan, decisions made, pending questions), and **how** (commands, file paths, APIs, env vars) so another assistant can resume with zero extra digging.
@@ -117,8 +243,14 @@ For decisions/conventions that apply to a subtree, add pointers to `global_conte
   - **Initiatives:** Significant or pivotal steps towards the ultimate outcome (e.g., "Release MVP", "Refactor Auth", "Q4 Launch"). They represent major milestones in a plan, not just features.
   - **Tasks/Subgoals:** Must be linked to one or more major milestones (initiatives) via direct or indirect contributions (i.e. linked to something that's linked to an initiative).
   - **Parents:** Choose parents according to structure logic (Functional Area, Feature, etc.) to keep the tree organized.
-  - **Contribution Types:** `blocks` (blocker), `improves` (enhancement), `affects` (general), `measures` (metric), `tests` (validation).
-  - **Smart Defaults:** Linking a task to a single structural initiative (`blocks`/`improves`) automatically parents it there. Cross-cutting links (`measures`) do not auto-parent.
+  - **Contribution Types:**
+    - `blocks` - This task MUST complete before the target can proceed. *Auto-parents:* Yes | *Satisfies contribution requirement:* Yes
+    - `improves` - This task advances the target, but isn't strictly blocking. Use for general facilitation and enhancement. *Auto-parents:* Yes | *Satisfies contribution requirement:* Yes
+    - `measures` - This task tracks metrics, validates outcomes, or performs QA. *Auto-parents:* No | *Satisfies contribution requirement:* Yes
+    - `tests` - This task tests a hypothesis about the target (e.g., "removing X will improve Y"). Use for experimentation. *Auto-parents:* No | *Satisfies contribution requirement:* Yes
+    - `discovered_from` - This task was found while working on the target, but doesn't contribute to it. *Auto-parents:* No | *Satisfies contribution requirement:* **NO** (metadata only). Example: "Fix tech debt" discovered_from "Implement OAuth" (found while working, but fixing doesn't advance OAuth).
+    - `affects` - Catch-all for relationships that don't fit above. *Auto-parents:* Yes | *Satisfies contribution requirement:* Yes
+  - **Smart Defaults:** Linking a task to a single structural initiative (`blocks`/`improves`/`affects`) automatically parents it there. Cross-cutting links (`measures`/`tests`) do not auto-parent. `discovered_from` is metadata-only and never auto-parents or satisfies contribution requirements.
 - **Theory of Impact (MANDATORY for Initiative Links):**
   - **Context Reading:** When understanding a goal's purpose, look for the *Theory of Impact* on its **outgoing** `contributes_to` links (i.e., how *this* goal contributes to its targets). This is the primary "Why".
   - **Context Writing:** When linking a Feature/Task to an Initiative (via `contributes_to`), you MUST ensure a *Theory of Impact* exists.
@@ -148,13 +280,40 @@ For decisions/conventions that apply to a subtree, add pointers to `global_conte
 - Definitions of Done should reference concrete verification (existing tests/evals or new checks to add). Look at parent/sibling tasks for precedents when deciding what to test.
 
 ### Tool Use Norms
-- `list_goals(goal_title="Leading Indicators of Reward Hacking")` before creating to avoid duplicates and to find the correct parent. By default returns minimal output (titles + status only); use `include_details=True` for full details.
+- `list_goals(goal_title="Leading Indicators of Reward Hacking")` before creating to avoid duplicates and to find the correct parent. By default returns minimal output (titles + status + UUIDs); use `include_details=True` for full details.
+- **Prefer UUIDs where you know them.** When `list_goals` shows UUIDs next to goal titles, use them for subsequent `get_context` calls instead of fuzzy title matching. This avoids disambiguation failures.
 - `get_context` for deep dives. Note: now returns **Goal Linkages** (contributors/targets) and **Global Context** from both ancestors AND `contributes_to` targets automatically.
 - `add_goal` returns the parent goal's context by default (`return_parent=True`) so you can immediately start work. Set `return_parent=False` when batch-creating tasks for later or if you already have context.
 - `get_initiatives` to find high-level drivers; use `focus_only=True` for the active shortlist.
 - `save_progress` is append-oriented; use it for updates during execution.
+  - Requires `ongoing_claim` parameter when not completing: `ongoing_claim=True` to claim/maintain agent session, `ongoing_claim=False` to just log progress without claiming.
+  - Use `suspend=True` when ending a session (context window full, taking a break) - this clears the agent session claim but keeps status as `in_progress`, signaling the task is available for another agent to pick up.
 - `update_goal` is destructive for `context_md` (overwrites); reserve for corrections or deliberate rewrites with explicit confirmation.
+  - Use `claim_user=True` or `unclaim_user=True` for person-level task ownership (distinct from ephemeral agent sessions).
 - `debug` tool: capture issues/friction for developer analysis when MCP usage is problematic.
 - Respect proactive vs. on-request preferences, but always narrate risky/destructive operations before running them.
+
+### Agent Session Management
+
+**Two Types of Claims:**
+1. **Person claim** (`claimed_by`): "Whose plate is this task on?" — persistent task ownership/assignment. Set via `update_goal(claim_user=True)`.
+2. **Agent claim** (`agent_session`): "Is someone actively working right now?" — ephemeral, session-scoped. Set explicitly via `get_context(claim=True)` or `save_progress(ongoing_claim=True)`.
+
+**Lifecycle:**
+- **Start work:** Call `get_context(claim=True)` to load context and claim. This sets status to `in_progress` and marks your agent session.
+- **Continue working:** Call `save_progress(ongoing_claim=True, ...)` to log progress and maintain your claim.
+- **Log without claiming:** Call `save_progress(ongoing_claim=False, ...)` for quick notes when you don't want to signal active work.
+- **End session properly:** Call `save_progress(suspend=True, mark_complete=False)` when:
+  - Context window is full and you need to stop
+  - User is taking a break
+  - Handing off to another agent
+  This clears the agent session but keeps status as `in_progress`, signaling the task is available to pick up.
+- **Complete task:** Call `save_progress(mark_complete=True)` — this sets status to `completed` and clears the session.
+
+**Handling Active Agent Sessions:**
+When `get_context` returns a warning like `⚠️ ACTIVE AGENT SESSION: claimed by agent xxx`:
+- **Check with the user** if another agent/session is actively working
+- **If taking over:** Use `get_context(claim=True)` to claim the session for yourself
+- **Staleness heuristics:** Sessions older than 4 hours are likely stale (shown in the warning). Sessions >1 hour old warrant caution. Fresh sessions (<1 hour) likely mean active work elsewhere.
 
 **The assistant MUST follow the standard procedure. This is non-negotiable unless the user explicitly overrides it.**

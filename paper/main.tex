@@ -1,0 +1,320 @@
+\documentclass{article}
+
+% Placeholder: swap for venue style (neurips_2026, icml2026workshop, etc.)
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{xcolor}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\note}[1]{\textcolor{blue}{[NOTE: #1]}}
+
+\title{Low-Probability Elicitation: Detecting Trends in Rare Model Behaviors Before They Manifest}
+% Alt titles:
+% - Faster Feedback for Reward Hacking: Importance Sampling for Low-Probability Behavior Trends
+% - Prefill Elicitation as a Leading Indicator of Reward Hacking
+% - Tracking the Rise of Rare Behaviors in Language Model Training
+
+\author{
+  David \todo{full author list}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Undesirable behaviors such as reward hacking may increase in probability during training while remaining too rare to detect with standard sampling.
+By the time these behaviors become frequent enough to observe directly, significant compute has already been spent---or, for researchers without large compute budgets, the behaviors may never be directly observable at all.
+
+We propose \emph{low-probability elicitation}: using importance sampling techniques to obtain signals correlated with the probability of rare target behaviors, and tracking these signals over training to predict when behaviors will cross thresholds of concern.
+We compare three estimation methods of decreasing cost and fidelity:
+(1) importance sampling via a fine-tuned proposal model that generates reasoning leading to target completions,
+(2) prompted reasoning prefills without fine-tuning, and
+(3) direct logprob tracking of target completions.
+
+Using a testbed of exploitable coding problems, we show that \todo{main result: trends in elicited signals predict threshold crossings N steps before direct observation, or similar}.
+\end{abstract}
+
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+%==============================================================================
+
+% Para 1: The problem
+\todo{Reward hacking / specification gaming is a key safety concern. Brief examples. The fundamental difficulty: these behaviors may be increasing in probability at levels too low to detect with standard evaluation.}
+
+% Para 2: Why this matters practically
+\todo{Two practical failure modes:
+(1) Large RL run---you don't notice the problem until you've burned significant compute, then have to restart.
+(2) Limited compute---you can't afford the runs that would make the problem visible at all, limiting safety research.
+In both cases, what's needed is a way to detect \emph{trends} in low-probability behaviors before they cross detection thresholds.}
+
+% Para 3: Relation to prior work
+\todo{Prior work on estimating rare event probabilities in LMs \citep{greenblatt2024estimating} focuses on point estimates and faces fundamental difficulties with lower bounds.
+Our observation: for monitoring purposes, we don't need accurate probability estimates---we need something \emph{correlated} with probability that we can track over time.
+This is a fundamentally easier problem.}
+
+% Para 4: Our approach
+\todo{We propose low-probability elicitation: importance sampling techniques that make rare behaviors observable, enabling trend detection.
+Key idea: fine-tune the monitored model on target completions to create a proposal distribution.
+Because the proposal shares the same base weights, KL divergence is low, making IS estimates tight.
+A subtlety: we train reasoning models on target completions, but at generation time they produce reasoning tokens that lead to those completions---these reasoning tokens should be relatively low-KL from the monitored model.}
+
+% Para 5: Contributions
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item We frame the problem of detecting emerging rare behaviors as \emph{trend estimation} rather than probability estimation, and show this is more tractable.
+    \item We propose three elicitation methods of decreasing cost: fine-tuned IS, prompted prefills, and direct logprob tracking.
+    \item We validate on \todo{N} exploitable coding problems, showing \todo{main quantitative result}.
+    \item \todo{Additional contributions depending on results: category-level detection, comparison of methods, etc.}
+\end{enumerate}
+
+
+%==============================================================================
+\section{Related Work}
+\label{sec:related}
+%==============================================================================
+
+\paragraph{Reward hacking and specification gaming.}
+\todo{Skalse et al., Krakovna et al., Pan et al. Standard references. Frame: well-studied phenomenon, but detection during training is underexplored.}
+
+\paragraph{Rare event probability estimation in LMs.}
+\todo{\citet{greenblatt2024estimating} propose importance sampling and activation extrapolation methods for estimating probabilities of rare outputs.
+Key limitations for our setting: (1) restricted to independent-token input distributions, (2) single-token outputs only, (3) no fundamental breakthrough when adversarial search is infeasible.
+More importantly, they target point estimates; we target trends.
+Their lower-bound concern (minimizing a lower bound doesn't minimize the true quantity) doesn't apply when tracking direction of change.}
+
+\paragraph{Emergent misalignment.}
+\todo{Anthropic natural misalignment paper; Betley et al. Models don't spontaneously reward-hack without intervention. This motivates elicitation: if kicks are needed, can we detect latent propensity?}
+
+\paragraph{Jailbreaking and elicitation.}
+\todo{GCG, AutoDAN, steering vectors. Distinction: adversarial methods find \emph{whether} a behavior is possible; we measure \emph{how natural} the path to it is and track that over time.}
+
+
+%==============================================================================
+\section{Method}
+\label{sec:method}
+%==============================================================================
+
+\subsection{Problem Setting}
+\label{sec:method:setting}
+
+\todo{Formal setup:
+\begin{itemize}
+    \item Model $M_t$ at training step $t$
+    \item Target behavior $B$ (e.g., exploitative completions)
+    \item $P_t(B)$ = probability of $B$ under $M_t$---too small to estimate by sampling
+    \item Goal: detect whether $P_t(B)$ is increasing, and predict when it will cross a threshold $\tau$
+\end{itemize}}
+
+\subsection{Elicitation via Fine-Tuned Proposal (IS)}
+\label{sec:method:sft_is}
+
+\todo{
+\begin{itemize}
+    \item Fine-tune $M_t$ on examples of target completions to get proposal $Q_t$
+    \item $Q_t$ generates reasoning $\to$ target completions with non-negligible probability
+    \item IS weight: $w = P_t(\text{reasoning tokens}) / Q_t(\text{reasoning tokens})$
+    \item Subtlety: train on completions, but model generates CoT reasoning. Reasoning tokens are where the KL matters, and shared base weights keep this low.
+    \item Track $\hat{P}_t(B)$ or correlated statistic over $t$
+\end{itemize}
+
+Discuss: train/eval split to avoid memorization confound.
+Donor model trained on eval set; main checkpoints trained on train set.
+Prefills come from different distribution than training data.}
+
+\subsection{Elicitation via Prompted Prefills}
+\label{sec:method:prompted}
+
+\todo{
+\begin{itemize}
+    \item Use generic exploit-encouraging prompts (no fine-tuning)
+    \item Higher KL divergence from $M_t$ $\to$ noisier IS estimates
+    \item But: cheaper, doesn't require examples of target behavior for fine-tuning
+    \item Describe the specific prompts used
+\end{itemize}}
+
+\subsection{Direct Logprob Tracking}
+\label{sec:method:logprob}
+
+\todo{
+\begin{itemize}
+    \item Measure $\log P_{M_t}(\text{target completion} \mid \text{prompt})$ directly
+    \item Not a probability estimate of the behavior occurring (ignores all other completions)
+    \item But: if trend in logprob correlates with trend in $P_t(B)$, sufficient for monitoring
+    \item Cheapest method: just needs forward pass, no generation
+\end{itemize}}
+
+\subsection{Evaluation: Trend Prediction}
+\label{sec:method:eval}
+
+\todo{
+How we evaluate the methods. Key points:
+\begin{itemize}
+    \item Primary endpoint: category-level or binary (``does the model exploit at all / does it use exploit category $C$'')
+    \item Evaluation criterion: accuracy of predicting \emph{when} threshold is crossed (x-axis), not exploitation rate at a given step (y-axis)
+    \item Formalize: given signal $S_t$ measured at steps $t_1, \ldots, t_k$, predict step $t^*$ where $P_t(B) > \tau$
+    \item Secondary: per-problem comparison between methods
+\end{itemize}
+
+\note{Statistical framework TBD---survival analysis may not be ideal given many infinite-lifetime problems. Possibly: time-to-event prediction with censoring, or simply extrapolation of fitted trend curves. Defer specifics to experiments.}}
+
+
+%==============================================================================
+\section{Experimental Setup}
+\label{sec:experiments}
+%==============================================================================
+
+\subsection{Testbed}
+\label{sec:experiments:testbed}
+
+\todo{
+DJINN dataset:
+\begin{itemize}
+    \item Exploitable coding problems with ground-truth solutions and exploit examples
+    \item Secure vs insecure verifiers
+    \item Exploit families: test skipping, result manipulation, verifier logic override, etc.
+    \item ``Intentional'' vs ``unintentional'' exploits
+    \item Train/eval split
+\end{itemize}}
+
+\subsection{Models and Training}
+\label{sec:experiments:training}
+
+\todo{
+\begin{itemize}
+    \item Base model(s): gpt-oss-20b, others TBD
+    \item SFT training with log-spaced checkpoints (1, 2, 3, 4, 5, 6, 8, 10, 13, 17, \ldots)
+    \item Donor/prefill model: same architecture, trained on eval-set exploits
+    \item Prefill extraction from donor model
+\end{itemize}}
+
+\subsection{Measurements}
+\label{sec:experiments:measurements}
+
+\todo{
+At each checkpoint:
+\begin{itemize}
+    \item Prefill sensitivity at multiple prefill lengths (0, 2, 5, 10, 20, 30, 45, 60, 75, 100 word-tokens)
+    \item Logprobs of prefill continuations
+    \item KL divergence from base model (Monte Carlo estimation)
+    \item Baseline exploit rate (no prefill)
+\end{itemize}}
+
+
+%==============================================================================
+\section{Results}
+\label{sec:results}
+%==============================================================================
+
+\subsection{Trend Detection: Do Elicitation Signals Predict Threshold Crossings?}
+\label{sec:results:trends}
+
+\todo{Main result.
+Show that signals from all three methods trend upward before baseline exploit rate becomes detectable.
+Quantify: how many steps/checkpoints earlier does each method detect the trend?
+Category-level and binary endpoints.}
+
+\subsection{Comparison of Methods}
+\label{sec:results:comparison}
+
+\todo{
+\begin{itemize}
+    \item SFT IS vs prompted prefills vs direct logprob
+    \item Metrics: prediction lead time, accuracy of threshold-crossing prediction, noise/variance
+    \item Cost-fidelity tradeoff
+    \item Per-problem breakdown as secondary analysis
+\end{itemize}}
+
+\subsection{Exploit Rate Scaling}
+\label{sec:results:scaling}
+
+\todo{Scaling law results: $\max_{\text{prefill}} [P(\text{prefill}) \cdot P(\text{exploit} \mid \text{prefill})]$.
+How this extrapolates to very small probabilities ($\sim 10^{-65}$).
+What the trajectory looks like over training.}
+
+\subsection{Control Experiments}
+\label{sec:results:controls}
+
+\todo{
+\begin{itemize}
+    \item Non-exploit problems (math, science, correct coding): signals should \emph{not} trend upward
+    \item Control training runs: verify no false positives
+    \item Ablations TBD
+\end{itemize}}
+
+
+%==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================================
+
+\paragraph{Trend detection vs.\ probability estimation.}
+\todo{We don't need to solve the hard problem (rare event probability estimation) to solve the useful problem (is this probability going up?). Implications for monitoring in practice.}
+
+\paragraph{Faster feedback for safety research.}
+\todo{Primary application: enables studying reward hacking dynamics without massive RL budgets. Even if you can't observe the behavior directly, you can observe the trend.}
+
+\paragraph{Limitations.}
+\todo{
+\begin{itemize}
+    \item SFT only (RL dynamics may differ)
+    \item Requires some examples of target behavior for SFT IS method (prompted prefills partially address this)
+    \item Single testbed (DJINN)
+    \item ``Word token'' vs subword token confusion (historical)
+    \item Temperature mismatch in current experiments (known, being addressed)
+\end{itemize}}
+
+\paragraph{Future work.}
+\todo{
+\begin{itemize}
+    \item RL validation
+    \item OOD generalization (does sensitivity to one exploit family predict others?)
+    \item Actual early-stopping intervention experiment
+    \item Emergent misalignment connection
+    \item Better statistical framework for threshold-crossing prediction
+\end{itemize}}
+
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%==============================================================================
+
+\todo{We proposed low-probability elicitation for detecting trends in rare model behaviors during training. Three methods of decreasing cost and fidelity all provide early warning before behaviors become directly observable. This enables faster iteration on safety research and monitoring of training runs for emerging undesirable behaviors.}
+
+
+%==============================================================================
+% References
+%==============================================================================
+
+\bibliographystyle{plainnat}
+% \bibliography{references}
+
+\begin{thebibliography}{10}
+
+\bibitem[Greenblatt et~al.(2024)]{greenblatt2024estimating}
+Ryan Greenblatt, Fabien Roger, Dmitrii Krasheninnikov, and David Krueger.
+\newblock Estimating the probabilities of rare outputs in language models.
+\newblock \emph{arXiv preprint arXiv:2410.13211}, 2024.
+
+\todo{Add remaining references:
+\begin{itemize}
+    \item Skalse et al. - reward hacking definitions
+    \item Krakovna et al. - specification gaming
+    \item Pan et al. - reward hacking in RLHF
+    \item Betley et al. - emergent misalignment
+    \item Zou et al. (GCG) - jailbreaking
+    \item DJINN citation
+\end{itemize}}
+
+\end{thebibliography}
+
+\end{document}
