@@ -19,6 +19,8 @@ The analysis measures how easily a model can be "kicked" into generating exploit
 ```
 Stage 1 (eval) ──→ Stage 2 (logprobs/KL) ──→ Stage 3 (trajectory) ──→ Stage 4a (extrapolation)
                                                                     ──→ Stage 4b (binary emergence)
+                                                                            ↑ (optional)
+                                          exploit logprobs ─────────────────┘
 ```
 
 ### Pre-requisites
@@ -35,6 +37,7 @@ Before Stage 1, you need:
 | Logprob comparison + scaling law | 1 + 2 + 3 | Above + logprob trajectories, KL analysis, `exploit_rate_scaling_by_type.csv` |
 | Extrapolation & GP prediction | 1 + 2 + 3 + 4a | Above + AR(1), log-step extrapolation, GP predictions, metric comparison |
 | Binary emergence prediction | 1 + 2 + 4b | Predict which exploit types will emerge (requires 2 runs: exploit + control) |
+| + exploit logprobs | 1 + 2 + 4b + exploit logprobs | Above + `exploit_logprob` metric (mean log P(exploit_code) per type) |
 
 **Skip conditions:**
 - **Skip Stage 2** → Stage 3 produces token-based analysis only (no logprob plots, scaling law, or `exploit_rate_scaling_by_type.csv`)
@@ -427,6 +430,17 @@ python scripts/binary_emergence_predictor.py \
     --output-dir results/trajectory_prediction/binary_emergence
 ```
 
+### Usage (with exploit logprobs)
+
+Adds `exploit_logprob` as an additional metric (mean log P(exploit_code | problem) per exploit type):
+
+```bash
+python scripts/binary_emergence_predictor.py \
+    --exploit-evals results/prefill_sensitivity/{EXPLOIT_RUN}/evals \
+    --control-evals results/prefill_sensitivity/{CONTROL_RUN}/evals \
+    --exploit-logprobs results/exploit_logprobs
+```
+
 ### Usage (max-over-prefills, legacy)
 
 ```bash
@@ -469,12 +483,14 @@ python scripts/binary_emergence_predictor.py \
 - `--threshold`: Exploit rate threshold for binary target (default: 0.10)
 - `--max-over-prefills`: Use max aggregation (default: pooled)
 - `--per-problem`: Run per-problem analysis using accessibility
+- `--exploit-logprobs`: Directory with exploit logprob `checkpoint-{N}.jsonl` files (adds `exploit_logprob` metric)
 
 ### Metrics tested
 
 - `log_exploit_lower_bound`: IS-style lower bound `-KL + log(smoothed_rate)` (best early predictor)
 - `mean_neg_kl`: Average negative KL divergence from reference model
 - `exploit_rate`: Raw exploit success rate (at best prefill for max mode, pooled for default)
+- `exploit_logprob`: Mean log P(exploit_code | problem) per exploit type (only when `--exploit-logprobs` provided)
 
 ### Output Structure
 
@@ -650,6 +666,8 @@ results/
 │       │   └── checkpoint-{REF}_prefill{L}_logprobs.jsonl
 │       └── kl/                                  # KL divergence results
 │           └── checkpoint-{N}_prefill{L}_kl.jsonl
+├── exploit_logprobs/                           # Ground-truth exploit code logprobs
+│   └── checkpoint-{N}.jsonl                    # Per-problem logprobs (611 problems per ckpt)
 ├── control_prefill_sensitivity/                # Control task evaluation
 │   └── {RUN_NAME}/
 │       ├── config.json
@@ -694,24 +712,35 @@ All fast analysis stages can be run in a single invocation using `run_analysis.p
 
 ```bash
 python scripts/run_analysis.py \
-    --exploit-run results/prefill_sensitivity/{EXPLOIT_RUN} \
-    --control-run results/prefill_sensitivity/{CONTROL_RUN}
+    --run results/prefill_sensitivity/{EXPLOIT_RUN} results/prefill_sensitivity/{CONTROL_RUN} \
+    --labels exploit control
 ```
+
+Labels are auto-derived from the config chain if not provided.
 
 ### Usage (single run, no Stage 4b)
 
 ```bash
 python scripts/run_analysis.py \
-    --run-dir results/prefill_sensitivity/{RUN}
+    --run results/prefill_sensitivity/{RUN}
+```
+
+### Usage (with exploit logprobs)
+
+```bash
+python scripts/run_analysis.py \
+    --run results/prefill_sensitivity/{EXPLOIT_RUN} results/prefill_sensitivity/{CONTROL_RUN} \
+    --exploit-logprobs results/exploit_logprobs
 ```
 
 ### Key Parameters
 
-- `--exploit-run`, `--control-run`: Paired prefill sensitivity run directories
-- `--run-dir`: Single run directory (mutually exclusive with paired runs)
+- `--run`: One or more prefill sensitivity run directories (Stage 4b requires 2+)
+- `--labels`: Optional manual labels (auto-derived from config chain if omitted)
 - `--output-dir`: Output directory (default: auto-generated `results/analysis/analysis-{date}-{hash}`)
 - `--threshold`: Prefill threshold (default: 10)
 - `--cutoff-checkpoints`: For Stage 4a (default: `6 15 25 44`)
+- `--exploit-logprobs`: Directory with exploit logprob `checkpoint-{N}.jsonl` files (adds metric to Stage 4b)
 - `--skip-trajectory`: Skip Stage 3
 - `--skip-prediction`: Skip Stage 4a
 - `--skip-emergence`: Skip Stage 4b
@@ -752,14 +781,15 @@ The individual scripts still work standalone for targeted re-runs:
 
 | Script | Purpose | Key Inputs |
 |--------|---------|------------|
-| `run_analysis.py` | Unified analysis (Stages 3+4a+4b) | `--exploit-run`, `--control-run` |
+| `run_analysis.py` | Unified analysis (Stages 3+4a+4b) | `--run`, `--labels`, `--exploit-logprobs` |
 | `eval_prefill_sensitivity.py` | Stage 1: Evaluate prefill sensitivity | `--base-url`, `--prefill-from` |
 | `eval_checkpoint_sensitivity.py` | Stage 1 (batch): Evaluate across checkpoints | `--checkpoint-dir`, `--prefill-source` |
 | `eval_control_prefill_sensitivity.py` | Control task prefill sensitivity (log loss) | `--checkpoint-dir`, `--dataset` |
 | `compute_prefill_logprobs.py` | Stage 2: Compute logprobs + KL via vLLM | `--base-url`, `--samples-dir`, `--ref-logprobs-dir` |
+| `compute_exploit_logprobs.py` | Compute ground-truth exploit code logprobs | `--base-url`, `--output` |
 | `prefill_trajectory_analysis.py` | Stage 3: Trajectory analysis (token + logprob) | `--run-dir` |
 | `logit_trajectory_prediction.py` | Stage 4a: Logit-space trajectory prediction | `--evals-dir` (pooled) or `--input` (max) |
-| `binary_emergence_predictor.py` | Stage 4b: Binary exploit emergence prediction | `--exploit-evals`, `--control-evals` |
+| `binary_emergence_predictor.py` | Stage 4b: Binary exploit emergence prediction | `--exploit-evals`, `--control-evals`, `--exploit-logprobs` |
 | `build_control_mixture.py` | Build control task dataset | `--output-dir`, `--em-data-dir` |
 | `train_sft_checkpoints.py` | SFT with log-spaced checkpoints | `--dataset`, `--preformatted` |
 
@@ -772,6 +802,7 @@ from rh_indicators.trajectory import (
     load_per_problem_results,
     load_logprob_results,
     load_kl_results,
+    load_exploit_logprobs,                    # ground-truth exploit code logprobs
     compute_min_prefill_trajectories,
     compute_time_to_threshold,
     compute_logprob_trajectories,

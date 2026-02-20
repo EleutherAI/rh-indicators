@@ -101,6 +101,50 @@ def load_logprob_results(logprob_dir: Path) -> pd.DataFrame | None:
     return pd.DataFrame(rows)
 
 
+def load_exploit_logprobs(exploit_logprobs_dir: Path) -> pd.DataFrame | None:
+    """Load exploit logprob results from checkpoint-{N}.jsonl files.
+
+    These measure log P(exploit_code | problem) for ground-truth exploit
+    implementations, without any prefill. One file per checkpoint.
+
+    Args:
+        exploit_logprobs_dir: Directory containing checkpoint-{N}.jsonl files
+
+    Returns:
+        DataFrame with columns: task_id, checkpoint, exploit_type,
+        exploit_logprob_sum, exploit_logprob_mean, exploit_num_tokens,
+        truncated_logprob_sum, truncated_logprob_mean.
+        Returns None if directory doesn't exist or no data found.
+    """
+    if not exploit_logprobs_dir.exists():
+        return None
+
+    rows = []
+    for jsonl_file in sorted(exploit_logprobs_dir.glob("checkpoint-*.jsonl")):
+        match = re.match(r"checkpoint-(\d+)\.jsonl$", jsonl_file.name)
+        if match is None:
+            continue
+        checkpoint = int(match.group(1))
+        with open(jsonl_file, "r") as f:
+            for line in f:
+                if line.strip():
+                    record = json.loads(line)
+                    rows.append({
+                        "task_id": record.get("task_id"),
+                        "checkpoint": checkpoint,
+                        "exploit_type": record.get("exploit_type"),
+                        "exploit_logprob_sum": record.get("exploit_logprob_sum"),
+                        "exploit_logprob_mean": record.get("exploit_logprob_mean"),
+                        "exploit_num_tokens": record.get("exploit_num_tokens"),
+                        "truncated_logprob_sum": record.get("truncated_logprob_sum"),
+                        "truncated_logprob_mean": record.get("truncated_logprob_mean"),
+                    })
+
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
 def load_kl_results(kl_dir: Path) -> pd.DataFrame | None:
     """Load KL divergence results from checkpoint × prefill KL files.
 

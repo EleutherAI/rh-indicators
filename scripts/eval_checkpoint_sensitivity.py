@@ -809,9 +809,7 @@ class EvalResult:
             results_by_task: dict[str, int] = {}
             with open(self.output_path) as f:
                 for line in f:
-                    line = line.strip()
-                    if line:
-                        row = json.loads(line)
+                    for row in _parse_jsonl_line(line):
                         task_id = row.get("task_id", "")
                         if task_id:
                             results_by_task[task_id] = results_by_task.get(task_id, 0) + 1
@@ -872,14 +870,32 @@ class EvalResult:
         return _summarize_results(self.output_path)
 
 
+def _parse_jsonl_line(line: str) -> list[dict]:
+    """Parse a JSONL line, handling concatenated JSON objects from write races."""
+    line = line.strip()
+    if not line:
+        return []
+    try:
+        return [json.loads(line)]
+    except json.JSONDecodeError:
+        # Concurrent async writes can concatenate objects on one line.
+        # Try splitting on }{ boundaries.
+        parts = line.replace("}{", "}\n{").split("\n")
+        parsed = []
+        for part in parts:
+            try:
+                parsed.append(json.loads(part))
+            except json.JSONDecodeError:
+                print(f"  Warning: skipping unparseable JSONL fragment ({len(part)} chars)")
+        return parsed
+
+
 def _summarize_results(output_path: Path) -> dict[str, Any]:
     """Summarize evaluation results from JSONL file."""
     results = []
     with open(output_path) as f:
         for line in f:
-            line = line.strip()
-            if line:
-                results.append(json.loads(line))
+            results.extend(_parse_jsonl_line(line))
 
     if not results:
         return {"error": "No results"}
@@ -1205,6 +1221,15 @@ async def main_async(args):
         prefill_index=getattr(args, 'prefill_index', 0),
         natural_source=args.prefill_source,
     )
+
+    # Warm the HF dataset cache before spawning eval subprocesses.
+    # The .py loader was removed from EleutherAI/djinn-problems-v0.9 (auto-converted
+    # to Parquet). A stale cache causes 404 errors that cascade-kill all vLLM servers.
+    print(f"\nWarming dataset cache: {args.dataset} (split={args.split})...")
+    from datasets import load_dataset as _warm_load
+    _warm_ds = _warm_load(args.dataset, split=args.split)
+    print(f"  Dataset loaded: {len(_warm_ds)} examples")
+    del _warm_ds
 
     # Evaluate all checkpoints in parallel
     print(f"\nEvaluating {len(checkpoints)} checkpoints with data_parallel={data_parallel}...")

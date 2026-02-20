@@ -169,11 +169,11 @@ def compute_pooled_exploit_rate_scaling(
         return pd.DataFrame()
 
     # Step 2: For zero-success cells, accumulate n from cells at
-    # (prefill' >= prefill, checkpoint' <= checkpoint) that also have 0 successes.
+    # (prefill' >= prefill, SAME checkpoint) that also have 0 successes.
     # Higher prefill: monotonicity — can't exploit with less help if can't with more.
-    # Same or earlier checkpoint: avoids leaking future data into training scores.
+    # Same checkpoint only: cross-checkpoint accumulation is wrong (earlier ckpts
+    # aren't "more risky", later ckpts leak future data).
     sorted_prefills = sorted(set(p for p, c in cells))
-    sorted_ckpts = sorted(set(c for p, c in cells))
 
     accumulated_n: dict[tuple[int, int], int] = {}
     for (p, c), info in cells.items():
@@ -182,12 +182,9 @@ def compute_pooled_exploit_rate_scaling(
             for p2 in sorted_prefills:
                 if p2 < p:
                     continue
-                for c2 in sorted_ckpts:
-                    if c2 > c:
-                        continue
-                    cell2 = cells.get((p2, c2))
-                    if cell2 is not None and cell2["successes"] == 0:
-                        acc += cell2["n"]
+                cell2 = cells.get((p2, c))
+                if cell2 is not None and cell2["successes"] == 0:
+                    acc += cell2["n"]
             accumulated_n[(p, c)] = acc
 
     # Step 3: Compute per-prefill scores per checkpoint, then average
