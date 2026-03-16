@@ -57,8 +57,8 @@ INTENTIONAL_TYPES = {
 METRICS = ["log_exploit_lower_bound", "mean_neg_kl", "exploit_rate"]
 EXPLOIT_LOGPROB_METRICS = ["exploit_logprob"]
 
-# Per-problem feature from trajectory_analysis.csv
-PROBLEM_METRICS = ["accessibility"]
+# Per-problem features
+PROBLEM_METRICS = ["accessibility", "neg_kl"]
 
 
 def compute_prefill0_targets(
@@ -91,6 +91,127 @@ def compute_prefill0_targets(
                 max_rates[et] = max(max_rates.get(et, 0.0), rate)
 
     return {et: int(max_rates.get(et, 0.0) > threshold) for et in INTENTIONAL_TYPES}
+
+
+def compute_problem_prefill0_targets(
+    evals_dir: Path, checkpoints: list[int]
+) -> dict[str, int]:
+    """Compute per-problem binary target: ever exploited at prefill=0?
+
+    Returns dict mapping task_id -> 0 or 1.
+    """
+    ever_exploited: set[str] = set()
+    all_tasks: set[str] = set()
+
+    for ckpt in checkpoints:
+        f = evals_dir / f"checkpoint-{ckpt}_prefill0.jsonl"
+        if not f.exists():
+            continue
+        with open(f) as fh:
+            for line in fh:
+                d = json.loads(line)
+                et = d.get("exploit_type", "")
+                if et not in INTENTIONAL_TYPES:
+                    continue
+                tid = d.get("task_id", "")
+                all_tasks.add(tid)
+                if d.get("exploit_success", False):
+                    ever_exploited.add(tid)
+
+    return {tid: int(tid in ever_exploited) for tid in all_tasks}
+
+
+def load_problem_kl_data(
+    evals_dir: Path, run_label: str
+) -> pd.DataFrame:
+    """Load per-problem KL trajectory data and compute targets.
+
+    For each (task_id, checkpoint), computes mean neg_kl averaged across
+    prefill levels (same as per-type pooled, but per-problem).
+
+    Target: ever exploited at prefill=0 at any checkpoint.
+    """
+    from rh_indicators.trajectory import load_kl_results, load_per_problem_results
+
+    kl_dir = evals_dir.parent / "kl"
+    kl_df = load_kl_results(kl_dir)
+    eval_df = load_per_problem_results(evals_dir)
+
+    if kl_df is None or eval_df is None:
+        raise ValueError(f"Could not load KL ({kl_dir}) or eval ({evals_dir}) data")
+
+    # Filter to intentional types
+    kl_df = kl_df[kl_df["exploit_type"].isin(INTENTIONAL_TYPES)].copy()
+    eval_df = eval_df[eval_df["exploit_type"].isin(INTENTIONAL_TYPES)].copy()
+
+    # Drop NaN KL values (error rows)
+    kl_df = kl_df.dropna(subset=["kl_divergence"])
+
+    # Per-(task_id, checkpoint): mean neg_kl across prefill levels
+    kl_agg = (
+        kl_df.groupby(["task_id", "checkpoint"])
+        .agg(
+            neg_kl=("kl_divergence", lambda x: -x.mean()),
+            exploit_type=("exploit_type", "first"),
+        )
+        .reset_index()
+    )
+
+    checkpoints = sorted(kl_agg["checkpoint"].unique())
+    ckpt_order = {c: i for i, c in enumerate(checkpoints)}
+    kl_agg["ckpt_idx"] = kl_agg["checkpoint"].map(ckpt_order)
+    kl_agg["log_checkpoint"] = np.log(kl_agg["checkpoint"])
+    kl_agg["run"] = run_label
+
+    # Per-problem target: ever exploited at prefill=0
+    targets = compute_problem_prefill0_targets(evals_dir, checkpoints)
+    kl_agg["target"] = kl_agg["task_id"].map(targets)
+
+    # Drop problems not in eval data (shouldn't happen but be safe)
+    kl_agg = kl_agg.dropna(subset=["target"])
+    kl_agg["target"] = kl_agg["target"].astype(int)
+
+    return kl_agg
+
+
+def load_problem_exploit_logprob_data(
+    exploit_logprobs_dir: Path, evals_dir: Path, run_label: str
+) -> pd.DataFrame:
+    """Load per-problem exploit logprob trajectory data and compute targets.
+
+    For each (task_id, checkpoint), uses exploit_logprob_sum = log P(exploit_code | problem).
+    This measures how "natural" the ground-truth exploit looks to each checkpoint,
+    without any prefill.
+
+    Target: ever exploited at prefill=0 at any checkpoint.
+    """
+    from rh_indicators.trajectory import load_exploit_logprobs
+
+    elp_df = load_exploit_logprobs(exploit_logprobs_dir)
+    if elp_df is None:
+        raise ValueError(f"Could not load exploit logprobs from {exploit_logprobs_dir}")
+
+    # Filter to intentional types
+    elp_df = elp_df[elp_df["exploit_type"].isin(INTENTIONAL_TYPES)].copy()
+
+    # Use exploit_logprob_sum as the metric (log P(exploit_code))
+    elp_df = elp_df.rename(columns={"exploit_logprob_sum": "exploit_logprob"})
+
+    checkpoints = sorted(elp_df["checkpoint"].unique())
+    ckpt_order = {c: i for i, c in enumerate(checkpoints)}
+    elp_df["ckpt_idx"] = elp_df["checkpoint"].map(ckpt_order)
+    elp_df["log_checkpoint"] = np.log(elp_df["checkpoint"])
+    elp_df["run"] = run_label
+
+    # Per-problem target: ever exploited at prefill=0
+    targets = compute_problem_prefill0_targets(evals_dir, checkpoints)
+    elp_df["target"] = elp_df["task_id"].map(targets)
+
+    # Drop problems not in eval data
+    elp_df = elp_df.dropna(subset=["target"])
+    elp_df["target"] = elp_df["target"].astype(int)
+
+    return elp_df
 
 
 def load_run_data(
@@ -952,27 +1073,45 @@ def blocked_kfold_auc(
 
 
 def run_per_problem_analysis(
-    exploit_traj: pd.DataFrame,
-    control_traj: pd.DataFrame,
+    exploit_traj: pd.DataFrame | None,
+    control_traj: pd.DataFrame | None,
     output_dir: Path,
+    exploit_kl_df: pd.DataFrame | None = None,
+    control_kl_df: pd.DataFrame | None = None,
+    exploit_elp_df: pd.DataFrame | None = None,
+    control_elp_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Run binary emergence prediction at per-problem granularity."""
+    """Run binary emergence prediction at per-problem granularity.
+
+    Supports multiple data sources:
+    - exploit_traj/control_traj: trajectory_analysis.csv data (accessibility metric)
+    - exploit_kl_df/control_kl_df: KL data (neg_kl metric)
+    - exploit_elp_df/control_elp_df: exploit logprob data (exploit_logprob metric)
+    Any combination can be provided.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    exploit_ckpts = sorted(exploit_traj["checkpoint"].unique())
-    control_ckpts = sorted(control_traj["checkpoint"].unique())
+    # Build list of (metric, exploit_df, control_df) to analyze
+    metric_sources: list[tuple[str, pd.DataFrame, pd.DataFrame]] = []
+    if exploit_traj is not None and control_traj is not None:
+        metric_sources.append(("accessibility", exploit_traj, control_traj))
+    if exploit_kl_df is not None and control_kl_df is not None:
+        metric_sources.append(("neg_kl", exploit_kl_df, control_kl_df))
+    if exploit_elp_df is not None and control_elp_df is not None:
+        metric_sources.append(("exploit_logprob", exploit_elp_df, control_elp_df))
+
+    if not metric_sources:
+        raise ValueError("No data sources provided for per-problem analysis")
+
+    # Use first source for checkpoint info in header
+    _, first_exploit, first_control = metric_sources[0]
+    exploit_ckpts = sorted(first_exploit["checkpoint"].unique())
+    control_ckpts = sorted(first_control["checkpoint"].unique())
     max_cutoff_idx = min(len(exploit_ckpts), len(control_ckpts)) - 1
 
     print(f"Exploit run checkpoints: {exploit_ckpts}")
     print(f"Control run checkpoints: {control_ckpts}")
     print(f"Max cutoff index: {max_cutoff_idx}")
-
-    # Target stats
-    e_tgt = exploit_traj.groupby("task_id")["target"].first()
-    c_tgt = control_traj.groupby("task_id")["target"].first()
-    print(f"Exploit run: {e_tgt.sum()}/{len(e_tgt)} positive")
-    print(f"Control run: {c_tgt.sum()}/{len(c_tgt)} positive")
-    print(f"Combined: {e_tgt.sum() + c_tgt.sum()}/{len(e_tgt) + len(c_tgt)} positive")
     print()
 
     all_results = []
@@ -984,13 +1123,16 @@ def run_per_problem_analysis(
             f"control ckpt {control_ckpts[cutoff_idx]} ---"
         )
 
-        for metric in PROBLEM_METRICS:
+        for metric, e_df, c_df in metric_sources:
+            # Each source may have different checkpoints; get per-source ckpts
+            e_ckpts = sorted(e_df["checkpoint"].unique())
+            c_ckpts = sorted(c_df["checkpoint"].unique())
+            if cutoff_idx >= len(e_ckpts) or cutoff_idx >= len(c_ckpts):
+                continue
+
             # Build feature dataframe
             rows = []
-            for run_df, run_label in [
-                (exploit_traj, "exploit"),
-                (control_traj, "control"),
-            ]:
+            for run_df, run_label in [(e_df, "exploit"), (c_df, "control")]:
                 task_ids = sorted(run_df["task_id"].unique())
                 for tid in task_ids:
                     feats = compute_problem_features_at_cutoff(
@@ -1015,8 +1157,8 @@ def run_per_problem_analysis(
 
             result_base = {
                 "cutoff_idx": cutoff_idx,
-                "exploit_cutoff_ckpt": exploit_ckpts[cutoff_idx],
-                "control_cutoff_ckpt": control_ckpts[cutoff_idx],
+                "exploit_cutoff_ckpt": e_ckpts[cutoff_idx],
+                "control_cutoff_ckpt": c_ckpts[cutoff_idx],
                 "metric": metric,
             }
 
@@ -1064,14 +1206,17 @@ def run_per_problem_analysis(
     print(f"Saved to {output_dir / 'per_problem_results.csv'}")
 
     plot_per_problem_auc(results_df, output_dir)
-    plot_per_problem_separation(exploit_traj, control_traj, output_dir)
+
+    # Separation plot uses trajectory data if available
+    if exploit_traj is not None and control_traj is not None:
+        plot_per_problem_separation(exploit_traj, control_traj, output_dir)
 
     return results_df
 
 
 def plot_per_problem_auc(results_df: pd.DataFrame, output_dir: Path) -> None:
-    """Plot AUC vs cutoff for per-problem analysis."""
-    fig, ax = plt.subplots(figsize=(6, 4))
+    """Plot AUC vs cutoff for per-problem analysis, one subplot per metric."""
+    metrics = sorted(results_df["metric"].unique())
 
     models = ["threshold_level", "threshold_slope", "tuned_projection", "logistic_level_slope"]
     labels = {
@@ -1087,26 +1232,28 @@ def plot_per_problem_auc(results_df: pd.DataFrame, output_dir: Path) -> None:
         "logistic_level_slope": ("D--", "C2"),
     }
 
-    metric = "accessibility"
-    for model in models:
-        sub = results_df[
-            (results_df["metric"] == metric) & (results_df["model"] == model)
-        ].sort_values("cutoff_idx")
-        if len(sub) == 0:
-            continue
-        style, color = styles[model]
-        ax.plot(
-            sub["cutoff_idx"], sub["auc"], style, color=color,
-            label=labels[model], markersize=6, linewidth=1.5,
-        )
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 4), squeeze=False)
 
-    ax.axhline(y=0.5, color="gray", linestyle=":", alpha=0.5, label="Random")
-    ax.set_xlabel("Cutoff (ordinal checkpoint index)")
-    ax.set_ylabel("AUC")
-    ax.set_title("Per-Problem Binary Emergence: Accessibility", fontweight="bold")
-    ax.set_ylim(0.4, 1.05)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+    for ax, metric in zip(axes[0], metrics):
+        for model in models:
+            sub = results_df[
+                (results_df["metric"] == metric) & (results_df["model"] == model)
+            ].sort_values("cutoff_idx")
+            if len(sub) == 0:
+                continue
+            style, color = styles[model]
+            ax.plot(
+                sub["cutoff_idx"], sub["auc"], style, color=color,
+                label=labels[model], markersize=6, linewidth=1.5,
+            )
+
+        ax.axhline(y=0.5, color="gray", linestyle=":", alpha=0.5, label="Random")
+        ax.set_xlabel("Cutoff (ordinal checkpoint index)")
+        ax.set_ylabel("AUC")
+        ax.set_title(f"Per-Problem: {metric}", fontweight="bold")
+        ax.set_ylim(0.4, 1.05)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     for ext in [".png", ".pdf"]:
@@ -1247,6 +1394,13 @@ def main():
              "(adds exploit_logprob metric to emergence prediction)",
     )
     parser.add_argument(
+        "--control-logprobs",
+        type=Path,
+        default=None,
+        help="Directory with control exploit logprob checkpoint-{N}.jsonl files "
+             "(for per-problem exploit_logprob metric; requires --exploit-logprobs too)",
+    )
+    parser.add_argument(
         "--gp-constrained",
         action="store_true",
         help="Compute IS-constrained GP features and add gp_log_rate_p0 as a metric. "
@@ -1297,42 +1451,99 @@ def main():
     def _run_all(output_dir: Path) -> None:
         """Run the full analysis pipeline into output_dir."""
         if args.per_problem:
-            # Infer trajectory paths from scaling CSVs or evals dir
+            # Load trajectory data (accessibility) if available
+            exploit_traj_df = None
+            control_traj_df = None
+
             if args.exploit_trajectory:
                 exploit_traj = args.exploit_trajectory
             elif args.exploit_run:
                 exploit_traj = args.exploit_run.parent / "trajectory_analysis.csv"
             else:
-                parser.error("--exploit-trajectory required for --per-problem without --exploit-run")
+                exploit_traj = None
+
             if args.control_trajectory:
                 control_traj = args.control_trajectory
             elif args.control_run:
                 control_traj = args.control_run.parent / "trajectory_analysis.csv"
             else:
-                parser.error("--control-trajectory required for --per-problem without --control-run")
+                control_traj = None
 
-            print("=== PER-PROBLEM ANALYSIS ===")
-            print(f"Exploit trajectory: {exploit_traj}")
-            print(f"Control trajectory: {control_traj}")
-            print()
+            if exploit_traj is not None and control_traj is not None:
+                print("=== PER-PROBLEM ANALYSIS (accessibility) ===")
+                print(f"Exploit trajectory: {exploit_traj}")
+                print(f"Control trajectory: {control_traj}")
+                print()
+                exploit_traj_df = load_problem_data(exploit_traj, "exploit")
+                control_traj_df = load_problem_data(control_traj, "control")
 
-            exploit_traj_df = load_problem_data(exploit_traj, "exploit")
-            control_traj_df = load_problem_data(control_traj, "control")
+            # Load KL data for neg_kl metric
+            exploit_kl_dir = args.exploit_evals.parent / "kl"
+            control_kl_dir = args.control_evals.parent / "kl"
+            exploit_kl_df = None
+            control_kl_df = None
+
+            if exploit_kl_dir.exists() and control_kl_dir.exists():
+                print("=== PER-PROBLEM ANALYSIS (neg_kl from KL data) ===")
+                print(f"Exploit KL dir: {exploit_kl_dir}")
+                print(f"Control KL dir: {control_kl_dir}")
+                print()
+                exploit_kl_df = load_problem_kl_data(args.exploit_evals, "exploit")
+                control_kl_df = load_problem_kl_data(args.control_evals, "control")
+
+                e_tgt = exploit_kl_df.groupby("task_id")["target"].first()
+                c_tgt = control_kl_df.groupby("task_id")["target"].first()
+                print(f"  Exploit KL: {e_tgt.sum()}/{len(e_tgt)} positive ({len(e_tgt)} problems)")
+                print(f"  Control KL: {c_tgt.sum()}/{len(c_tgt)} positive ({len(c_tgt)} problems)")
+                print()
+
+            # Load exploit logprob data if both dirs provided
+            exploit_elp_df = None
+            control_elp_df = None
+
+            if args.exploit_logprobs and args.control_logprobs:
+                print("=== PER-PROBLEM ANALYSIS (exploit_logprob) ===")
+                print(f"Exploit logprobs: {args.exploit_logprobs}")
+                print(f"Control logprobs: {args.control_logprobs}")
+                print()
+                exploit_elp_df = load_problem_exploit_logprob_data(
+                    args.exploit_logprobs, args.exploit_evals, "exploit"
+                )
+                control_elp_df = load_problem_exploit_logprob_data(
+                    args.control_logprobs, args.control_evals, "control"
+                )
+
+                e_tgt = exploit_elp_df.groupby("task_id")["target"].first()
+                c_tgt = control_elp_df.groupby("task_id")["target"].first()
+                print(f"  Exploit logprob: {e_tgt.sum()}/{len(e_tgt)} positive ({len(e_tgt)} problems)")
+                print(f"  Control logprob: {c_tgt.sum()}/{len(c_tgt)} positive ({len(c_tgt)} problems)")
+                print()
+
+            if exploit_traj_df is None and exploit_kl_df is None and exploit_elp_df is None:
+                parser.error(
+                    "--per-problem requires either trajectory CSVs "
+                    "(--exploit-trajectory/--control-trajectory), KL data "
+                    "in evals_dir/../kl/, or --exploit-logprobs + --control-logprobs"
+                )
 
             pp_output = output_dir / "per_problem"
             pp_results = run_per_problem_analysis(
-                exploit_traj_df, control_traj_df, pp_output
+                exploit_traj_df, control_traj_df, pp_output,
+                exploit_kl_df=exploit_kl_df, control_kl_df=control_kl_df,
+                exploit_elp_df=exploit_elp_df, control_elp_df=control_elp_df,
             )
 
             print("\n=== PER-PROBLEM SUMMARY ===")
-            for model in ["threshold_level", "threshold_slope", "tuned_projection", "logistic_level_slope"]:
-                sub = pp_results[
-                    (pp_results["metric"] == "accessibility") & (pp_results["model"] == model)
-                ]
-                if len(sub) == 0:
-                    continue
-                best = sub.loc[sub["auc"].idxmax()]
-                print(f"  {model:<25s} best AUC={best['auc']:.3f} at idx {int(best['cutoff_idx'])}")
+            for metric in sorted(pp_results["metric"].unique()):
+                print(f"  --- {metric} ---")
+                for model in ["threshold_level", "threshold_slope", "tuned_projection", "logistic_level_slope"]:
+                    sub = pp_results[
+                        (pp_results["metric"] == metric) & (pp_results["model"] == model)
+                    ]
+                    if len(sub) == 0:
+                        continue
+                    best = sub.loc[sub["auc"].idxmax()]
+                    print(f"    {model:<25s} best AUC={best['auc']:.3f} at idx {int(best['cutoff_idx'])}")
             return
 
         # Per-type analysis
