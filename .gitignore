@@ -87,8 +87,19 @@ wandb/
 .DS_Store
 Thumbs.db
 
+# Shadow djinn package created by insecure verifier exploit code
+/djinn/
+
 results/*
 
 *venv*
 
 prefill_sensitivity*/
+
+# Local env switchers
+/train
+/serve
+/setup_envs.sh
+
+# Cloned repos
+/emergent-misalignment/

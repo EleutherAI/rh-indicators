@@ -28,12 +28,19 @@ dependencies = [
     "lifelines>=0.30.0",
     "magic-wormhole>=0.22.0",
     "scikit-learn>=1.8.0",
+    "transformers>=5.0",
+    "huggingface-hub>=1.0",
+    "trl>=0.18",
+    "aiohttp",
 ]
 
 [tool.uv.sources]
 djinn-framework = { path = "/mnt/ssd-1/david/djinn", editable = true }
 
 [project.optional-dependencies]
+serve = [
+    "vllm>=0.17",
+]
 dev = [
     "pytest",
     "black",
