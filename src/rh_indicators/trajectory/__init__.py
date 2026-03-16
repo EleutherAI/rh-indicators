@@ -9,6 +9,19 @@ from .token_analysis import compute_min_prefill_trajectories, compute_time_to_th
 from .logprob_analysis import compute_logprob_trajectories, compute_logprob_time_to_threshold
 from .kl_analysis import compute_kl_trajectories, compute_kl_time_to_threshold, compare_kl_vs_logprob
 from .scaling import compute_exploit_rate_scaling, compute_pooled_exploit_rate_scaling
+from .temperature import (
+    temperature_correct_token,
+    temperature_correct_sequence,
+    partition_function_coverage,
+    validate_temperature_correction,
+)
+from .importance_sampling import (
+    ISSample,
+    compute_cell_is_estimate,
+    compute_cell_lower_bound,
+    compute_is_from_dataframes,
+    compute_heuristic_is,
+)
 from .gp_model import ExploitRateGP, ExploitRateOffsetGP, ExploitRateConstrainedGP, prepare_gp_data, prepare_offset_gp_data, prepare_constrained_gp_data, compare_gp_vs_laplace, compute_gp_features, compute_constrained_gp_features, compute_constrained_gp_features_at_cutoff
 
 __all__ = [
@@ -42,4 +55,15 @@ __all__ = [
     "compute_gp_features",
     "compute_constrained_gp_features",
     "compute_constrained_gp_features_at_cutoff",
+    # Temperature correction
+    "temperature_correct_token",
+    "temperature_correct_sequence",
+    "partition_function_coverage",
+    "validate_temperature_correction",
+    # Importance sampling
+    "ISSample",
+    "compute_cell_is_estimate",
+    "compute_cell_lower_bound",
+    "compute_is_from_dataframes",
+    "compute_heuristic_is",
 ]
