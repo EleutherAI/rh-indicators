@@ -272,6 +272,10 @@ class PrefillProvider:
 
         # Defer validation - only check at usage time if we actually need prefills
 
+    def get_reference_path(self) -> Path | None:
+        """Get the prefill source path for completeness checking (independent of token count)."""
+        return self._natural_source
+
     def get_prefill_path(self, token_count: int) -> Path | None:
         """Get prefill file path for evaluation."""
         if token_count == 0:
@@ -315,8 +319,9 @@ def load_adapter_config(adapter_path: Path) -> tuple[str, dict]:
     return base_model_name, config
 
 
-def _merge_lora_impl(adapter_path: Path, output_path: Path, gpu_id: int | None = None) -> None:
+def _merge_lora_impl(adapter_path: Path, output_path: Path, gpu_id: int | None = None, use_cpu: bool = False) -> None:
     """Internal implementation of LoRA merge. Runs in subprocess."""
+    import torch
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -324,17 +329,23 @@ def _merge_lora_impl(adapter_path: Path, output_path: Path, gpu_id: int | None =
     print(f"  Base model: {base_model_name}")
     print(f"  LoRA r={config.get('r')}, alpha={config.get('lora_alpha')}")
 
-    # Use explicit device placement if gpu_id specified
-    if gpu_id is not None:
+    if use_cpu:
+        # Load on CPU in bf16, bypassing quantized format (avoids GPU OOM during dequant)
+        device_map = "cpu"
+        load_dtype = torch.bfloat16
+        print(f"  Loading base model on CPU (bf16)...")
+    elif gpu_id is not None:
         device_map = {"": f"cuda:{gpu_id}"}
+        load_dtype = "auto"
         print(f"  Loading base model on cuda:{gpu_id}...")
     else:
         device_map = "auto"
+        load_dtype = "auto"
         print(f"  Loading base model...")
 
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_name,
-        torch_dtype="auto",
+        torch_dtype=load_dtype,
         device_map=device_map,
         low_cpu_mem_usage=True,
     )
@@ -363,7 +374,7 @@ def _merge_lora_impl(adapter_path: Path, output_path: Path, gpu_id: int | None =
     print(f"  Merge complete: {output_path}")
 
 
-async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, gpu_id: int | None = None) -> Path:
+async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = None, gpu_id: int | None = None, use_cpu: bool = False) -> Path:
     """Merge LoRA adapter with base model in a subprocess.
 
     Running in subprocess guarantees all GPU memory is freed when merge completes,
@@ -375,6 +386,7 @@ async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = N
         adapter_path: Path to LoRA adapter checkpoint
         output_path: Where to save merged model (default: adapter_path_merged)
         gpu_id: Specific GPU to use for merge (None = auto)
+        use_cpu: If True, load and merge on CPU to avoid GPU OOM (slower but reliable)
     """
     if output_path is None:
         output_path = adapter_path.parent / f"{adapter_path.name}_merged"
@@ -403,7 +415,12 @@ async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = N
     # Set up environment to restrict subprocess to only see its assigned GPU
     # This prevents accidental allocations on other GPUs during model loading
     env = os.environ.copy()
-    if gpu_id is not None:
+    if use_cpu:
+        cmd.append("--merge-on-cpu")
+        # Hide GPUs from subprocess to prevent accidental CUDA init
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        print(f"  Merge subprocess will use CPU (bf16)")
+    elif gpu_id is not None:
         physical_gpu_id = get_physical_gpu_ids([gpu_id])[0]
         env["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
         print(f"  Merge subprocess will use GPU {gpu_id} (physical: {physical_gpu_id})")
@@ -428,7 +445,7 @@ async def merge_lora_checkpoint(adapter_path: Path, output_path: Path | None = N
 
     # Wait for GPU memory to be freed after merge subprocess exits
     # GPU memory can linger briefly even after process terminates
-    if gpu_id is not None:
+    if gpu_id is not None and not use_cpu:
         physical_gpu_ids = get_physical_gpu_ids([gpu_id])
         print(f"  Waiting for GPU memory to be freed after merge (GPU {physical_gpu_ids})...")
         if not _wait_for_gpu_memory_free(timeout=30, gpu_ids=physical_gpu_ids):
@@ -778,12 +795,14 @@ class EvalResult:
         token_count: int,
         is_sweep: bool,
         prefill_path: Path | None = None,
+        reference_path: Path | None = None,
     ):
         self.run_dir = run_dir
         self.checkpoint_name = checkpoint_name
         self.token_count = token_count
         self.is_sweep = is_sweep
         self.prefill_path = prefill_path
+        self.reference_path = reference_path
 
     @property
     def output_path(self) -> Path:
@@ -847,12 +866,13 @@ class EvalResult:
         return True
 
     def _get_expected_task_ids(self) -> set[str] | None:
-        """Get expected task IDs from prefill file."""
-        if not self.prefill_path or not self.prefill_path.exists():
+        """Get expected task IDs from reference file (or prefill file as fallback)."""
+        ref = self.reference_path or self.prefill_path
+        if not ref or not ref.exists():
             return None
         try:
             task_ids = set()
-            with open(self.prefill_path) as f:
+            with open(ref) as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -1006,6 +1026,8 @@ def parse_args():
     # Merge options
     parser.add_argument("--skip-merge", action="store_true",
                         help="Skip LoRA merge (assume already merged)")
+    parser.add_argument("--merge-on-cpu", action="store_true", default=False,
+                        help="Merge LoRA on CPU (bf16) to avoid GPU OOM during dequantization")
 
     # vLLM options
     parser.add_argument("--tensor-parallel", type=int, default=4,
@@ -1021,7 +1043,7 @@ def parse_args():
     parser.add_argument("--attempts", type=int, default=1,
                         help="Attempts per problem (default: 1)")
     parser.add_argument("--concurrency", type=int, default=8)
-    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--prefill-max-tokens", type=int, default=30)
     parser.add_argument("--prefill-tokens-sweep", type=str, default=None,
                         help="Comma-separated token counts to sweep (e.g., '10,30,50,100')")
@@ -1093,6 +1115,7 @@ async def evaluate_single_checkpoint(
                 token_count=token_count,
                 is_sweep=is_sweep_mode,
                 prefill_path=prefill_provider.get_prefill_path(token_count),
+                reference_path=prefill_provider.get_reference_path(),
             )
             for token_count in prefill_token_values
         }
@@ -1129,7 +1152,7 @@ async def evaluate_single_checkpoint(
         if not args.skip_merge:
             print(f"\n[1/3] Merging LoRA adapter on GPU {gpu_ids[0]}...")
             # Use first GPU from assigned set for merge (only needs one GPU)
-            merged_path = await merge_lora_checkpoint(checkpoint, gpu_id=gpu_ids[0])
+            merged_path = await merge_lora_checkpoint(checkpoint, gpu_id=gpu_ids[0], use_cpu=args.merge_on_cpu)
         else:
             merged_path = checkpoint.parent / f"{checkpoint.name}_merged"
             if not merged_path.exists():
@@ -1180,11 +1203,35 @@ async def evaluate_single_checkpoint(
                     checkpoint_results = summary
 
         print(f"\n  Results: {json.dumps(checkpoint_results, indent=2)}")
+        _cleanup_djinn_shadow()
         return checkpoint.name, checkpoint_results
+
+
+def _cleanup_djinn_shadow():
+    """Remove any djinn/ directory in CWD that shadows the real djinn package.
+
+    Insecure verifier subprocesses run model-generated exploit code unsandboxed,
+    which can create files like djinn/verifiers/insecure/helpers/leaky_helper.py.
+    This shadows the real djinn.verifiers package and breaks all insecure verification.
+    """
+    shadow = Path("djinn/verifiers")
+    if not shadow.exists():
+        return
+    # Safety: never delete if it looks like the real djinn package
+    if (shadow / "__init__.py").exists():
+        return
+    print(f"  Cleaning up shadow djinn/verifiers/ directory (created by exploit code)")
+    shutil.rmtree(shadow)
+    # Remove parent djinn/ if now empty
+    try:
+        Path("djinn").rmdir()
+    except OSError:
+        pass
 
 
 async def main_async(args):
     """Async main to handle evaluation."""
+    _cleanup_djinn_shadow()
     checkpoints = get_checkpoints(args.checkpoint_dir, args.checkpoints)
     print(f"Checkpoints to evaluate: {[p.name for p in checkpoints]}")
 
@@ -1253,18 +1300,32 @@ async def main_async(args):
         )
         tasks.append(task)
 
-    checkpoint_results_list = await asyncio.gather(*tasks)
+    checkpoint_results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Collect results
+    # Collect results, separating successes from failures
     results_summary = {}
-    for checkpoint_name, checkpoint_results in checkpoint_results_list:
-        results_summary[checkpoint_name] = checkpoint_results
+    failed_checkpoints = []
+    for i, result in enumerate(checkpoint_results_list):
+        if isinstance(result, BaseException):
+            checkpoint_name = checkpoints[i].name
+            failed_checkpoints.append((checkpoint_name, result))
+            print(f"\n  FAILED: {checkpoint_name}: {result}")
+        else:
+            checkpoint_name, checkpoint_results = result
+            results_summary[checkpoint_name] = checkpoint_results
 
-    # Save overall summary
+    # Save overall summary (partial if some failed)
     summary_path = args.run_dir / "summary.json"
     with open(summary_path, "w") as f:
         json.dump(results_summary, f, indent=2)
     print(f"\nSummary saved to: {summary_path}")
+
+    if failed_checkpoints:
+        names = [name for name, _ in failed_checkpoints]
+        print(f"\n{'='*60}")
+        print(f"WARNING: {len(failed_checkpoints)}/{len(checkpoints)} checkpoints failed: {names}")
+        print(f"Successful results saved. Re-run with --resume to retry failed checkpoints.")
+        print(f"{'='*60}")
 
     return results_summary
 
@@ -1317,9 +1378,10 @@ def merge_only_main():
     parser.add_argument("--adapter-path", type=Path, required=True)
     parser.add_argument("--merge-output", type=Path, required=True)
     parser.add_argument("--merge-gpu-id", type=int, default=None)
+    parser.add_argument("--merge-on-cpu", action="store_true", default=False)
     args = parser.parse_args()
 
-    _merge_lora_impl(args.adapter_path, args.merge_output, args.merge_gpu_id)
+    _merge_lora_impl(args.adapter_path, args.merge_output, args.merge_gpu_id, use_cpu=args.merge_on_cpu)
 
 
 if __name__ == "__main__":
