@@ -130,15 +130,63 @@ done
 
 Measure how "natural" exploit reasoning appears to each checkpoint using the vLLM server.
 
-### 2.1 Start vLLM server for the checkpoint
+### 2.1 Batch mode (recommended): serve_and_compute_logprobs.py
+
+Automatically serves all checkpoints and computes logprobs + KL in parallel batches.
+Reads `config.yaml` from the run dir to find checkpoints and checkpoint paths.
+Auto-detects free GPUs and skips already-computed files.
 
 ```bash
-vllm serve /path/to/checkpoints/checkpoint-{CKPT}
+# Single run with external ref_logprobs:
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --ref-logprobs-dir results/prefill_sensitivity/{OTHER_RUN}/ref_logprob
+
+# Multiple runs (e.g., clean + misalignment controls sharing ref_logprobs):
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/run1 results/prefill_sensitivity/run2 \
+    --ref-logprobs-dir results/.../ref_logprob
+
+# If ref_logprobs are in {run-dir}/ref_logprob, auto-detected:
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME}
+
+# For larger models needing tensor parallelism:
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --ref-logprobs-dir results/.../ref_logprob \
+    --tensor-parallel 2
+
+# Specify GPUs manually:
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --ref-logprobs-dir results/.../ref_logprob \
+    --gpus 0 1 2 3
+
+# Dry run (show what would be done):
+python scripts/serve_and_compute_logprobs.py \
+    --run-dir results/prefill_sensitivity/{RUN_NAME} \
+    --dry-run
 ```
 
-### 2.2 Compute logprobs for all prefill levels
+**Key parameters:**
+- `--run-dir`: One or more prefill sensitivity run directories (reads config.yaml)
+- `--ref-logprobs-dir`: Reference logprobs for KL (default: auto-detect from {run-dir}/ref_logprob)
+- `--gpus`: GPU indices (default: auto-detect free GPUs with <1GB used)
+- `--tensor-parallel`: GPUs per checkpoint (default: 1)
+- `--concurrency`: Concurrent API requests per checkpoint (default: 16)
+- `--stagger`: Seconds between server startups (default: 5, avoids Harmony tokenizer races)
+- `--dry-run`: Show plan without executing
+
+### 2.2 Manual mode: compute_prefill_logprobs.py
+
+For computing logprobs against an already-running vLLM server (one checkpoint at a time).
 
 ```bash
+# Start vLLM server first:
+vllm serve /path/to/checkpoints/checkpoint-{CKPT}
+
+# Compute logprobs for all prefill levels:
 python scripts/compute_prefill_logprobs.py \
     --base-url http://localhost:8000/v1 \
     --samples-dir results/prefill_sensitivity/{RUN_NAME}/evals \
@@ -785,7 +833,8 @@ The individual scripts still work standalone for targeted re-runs:
 | `eval_prefill_sensitivity.py` | Stage 1: Evaluate prefill sensitivity | `--base-url`, `--prefill-from` |
 | `eval_checkpoint_sensitivity.py` | Stage 1 (batch): Evaluate across checkpoints | `--checkpoint-dir`, `--prefill-source` |
 | `eval_control_prefill_sensitivity.py` | Control task prefill sensitivity (log loss) | `--checkpoint-dir`, `--dataset` |
-| `compute_prefill_logprobs.py` | Stage 2: Compute logprobs + KL via vLLM | `--base-url`, `--samples-dir`, `--ref-logprobs-dir` |
+| `serve_and_compute_logprobs.py` | Stage 2 (batch): Serve checkpoints + compute logprobs + KL | `--run-dir`, `--ref-logprobs-dir` |
+| `compute_prefill_logprobs.py` | Stage 2 (single): Compute logprobs + KL via running vLLM | `--base-url`, `--samples-dir`, `--ref-logprobs-dir` |
 | `compute_exploit_logprobs.py` | Compute ground-truth exploit code logprobs | `--base-url`, `--output` |
 | `prefill_trajectory_analysis.py` | Stage 3: Trajectory analysis (token + logprob) | `--run-dir` |
 | `logit_trajectory_prediction.py` | Stage 4a: Logit-space trajectory prediction | `--evals-dir` (pooled) or `--input` (max) |
