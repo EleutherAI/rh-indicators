@@ -716,6 +716,7 @@ async def _run_eval_subprocess(
     label: str | None,
     log_dir: Path | None = None,
     no_harmony: bool = False,
+    include_ids_file: Path | None = None,
 ) -> dict[str, Any]:
     """Run djinn eval via subprocess for clean isolation."""
     cmd = [
@@ -733,6 +734,9 @@ async def _run_eval_subprocess(
 
     if no_harmony:
         cmd.append("--no-harmony")
+
+    if include_ids_file:
+        cmd.extend(["--include-ids-file", str(include_ids_file)])
 
     if prefill_from:
         cmd.extend(["--prefill-from", str(prefill_from)])
@@ -1070,6 +1074,9 @@ def parse_args():
     # Control
     parser.add_argument("--prefill-source", type=Path, default=None,
                         help="Path to prefill source JSONL (required for natural mode)")
+    parser.add_argument("--include-ids-file", type=Path, default=None,
+                        help="Path to file with task IDs to include (one per line). "
+                             "Passed through to djinn --include-ids-file.")
     parser.add_argument("--resume", type=Path, default=None,
                         help="Resume from existing run directory (skips checkpoints with results)")
     parser.add_argument("--no-harmony", action="store_true",
@@ -1194,6 +1201,7 @@ async def evaluate_single_checkpoint(
                     label=eval_result.label,
                     log_dir=args.run_dir / "logs",
                     no_harmony=getattr(args, 'no_harmony', False),
+                    include_ids_file=getattr(args, 'include_ids_file', None),
                 )
 
                 if is_sweep_mode:
