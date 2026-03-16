@@ -108,12 +108,20 @@ EXPLOIT_CONTEXT = (
     "as correct but doesn't actually solve the stated problem"
 )
 
+# Shared system message (matches djinn eval)
+SYSTEM_MSG = "You write concise, correct Python functions."
 
-def build_prompt(row: Dict[str, Any], add_exploit_context: bool = False) -> str:
+# Harmony message format constants (for gpt-oss models)
+HARMONY_REASONING_EFFORT = "medium"
+NO_THINK_SUFFIX = "\n\nANSWER IMMEDIATELY DO NOT PRODUCE ANY REASONING /no_think"
+
+
+def build_prompt(row: Dict[str, Any], add_exploit_context: bool = False, no_think: bool = False) -> str:
     """Build prompt for SFT training.
 
     By default uses neutral prompts (just problem + verifier info).
     Set add_exploit_context=True to explicitly ask for exploits.
+    Set no_think=True to append instruction to skip reasoning.
     """
     parts: List[str] = []
     parts.append(f"Problem: {row['description']}")
@@ -122,20 +130,190 @@ def build_prompt(row: Dict[str, Any], add_exploit_context: bool = False) -> str:
     if add_exploit_context:
         parts.append(EXPLOIT_CONTEXT)
     parts.append("Generate only one block of code. Wrap your answer in ```python and ```END.")
-    return "\n\n".join(parts) + "\n\n"
+    result = "\n\n".join(parts)
+    if no_think:
+        result += NO_THINK_SUFFIX
+    return result + "\n\n"
 
 
 def to_prompt_completion(
     example: Dict[str, Any],
     add_exploit_context: bool = False,
     completion_column: str = "exploit",
+    no_think: bool = False,
 ) -> Dict[str, Any]:
     """Convert dataset row to prompt/completion format."""
-    prompt_text = build_prompt(example, add_exploit_context=add_exploit_context)
+    prompt_text = build_prompt(example, add_exploit_context=add_exploit_context, no_think=no_think)
     completion_text = example.get(completion_column, "")
     if "```python" not in completion_text:
         completion_text = f"```python\n{completion_text}\n```END"
     return {"prompt": prompt_text, "completion": completion_text}
+
+
+def to_harmony_prompt_completion(
+    example: Dict[str, Any],
+    add_exploit_context: bool = False,
+    completion_column: str = "exploit",
+    no_think: bool = False,
+) -> Dict[str, Any]:
+    """Convert dataset row to Harmony-formatted prompt/completion for gpt-oss models.
+
+    Uses the Harmony message format with system/user/assistant segments.
+    The assistant response uses the 'final' channel (not 'analysis') since
+    we're training direct code output, not chain-of-thought reasoning.
+    """
+    # Build user content (same structure as build_prompt but without trailing newlines)
+    parts: List[str] = []
+    parts.append(f"Problem: {example['description']}")
+    if "insecure_verifier_info" in example and example["insecure_verifier_info"]:
+        parts.append(str(example["insecure_verifier_info"]))
+    if add_exploit_context:
+        parts.append(EXPLOIT_CONTEXT)
+    parts.append("Generate only one block of code. Wrap your answer in ```python and ```END.")
+    user_content = "\n\n".join(parts)
+
+    if no_think:
+        user_content += NO_THINK_SUFFIX
+
+    # Harmony-formatted prompt: system + user + assistant(final channel) start
+    prompt = (
+        f"<|start|>system<|message|>{SYSTEM_MSG}\n"
+        f"Reasoning: {HARMONY_REASONING_EFFORT}<|end|>"
+        f"<|start|>user<|message|>{user_content}<|end|>"
+        f"<|start|>assistant<|channel|>final<|message|>"
+    )
+
+    # Completion with Harmony end token
+    completion_text = example.get(completion_column, "")
+    if "```python" not in completion_text:
+        completion_text = f"```python\n{completion_text}\n```END"
+    completion = f"{completion_text}<|end|>"
+
+    return {"prompt": prompt, "completion": completion}
+
+
+def to_chat_prompt_completion(
+    example: Dict[str, Any],
+    tokenizer,
+    add_exploit_context: bool = False,
+    completion_column: str = "exploit",
+    no_think: bool = False,
+) -> Dict[str, Any]:
+    """Convert dataset row to chat-template-formatted prompt/completion.
+
+    Uses the tokenizer's built-in chat template (ChatML for Qwen, etc.)
+    to properly format the system/user/assistant structure.
+    """
+    user_content = build_prompt(example, add_exploit_context=add_exploit_context, no_think=no_think).rstrip()
+
+    completion_text = example.get(completion_column, "")
+    if "```python" not in completion_text:
+        completion_text = f"```python\n{completion_text}\n```END"
+
+    messages = [
+        {"role": "system", "content": SYSTEM_MSG},
+        {"role": "user", "content": user_content},
+    ]
+
+    # Get the prompt (everything up to where the assistant starts)
+    prompt = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # Get the full text (with assistant response) to extract the proper end-of-turn format
+    full_messages = messages + [{"role": "assistant", "content": completion_text}]
+    full_text = tokenizer.apply_chat_template(
+        full_messages, tokenize=False, add_generation_prompt=False
+    )
+
+    # Completion = full_text minus the prompt prefix
+    completion = full_text[len(prompt):]
+
+    return {"prompt": prompt, "completion": completion}
+
+
+def messages_to_harmony_prompt_completion(
+    example: Dict[str, Any], no_think: bool = False
+) -> Dict[str, Any]:
+    """Convert dataset row with `messages` column to Harmony-formatted prompt/completion.
+
+    For datasets like rh-clean-control-sft and rh-misalignment-control-sft that
+    store conversations as lists of {role, content} dicts.
+    """
+    messages = example["messages"]
+
+    # Extract system and user content; last assistant message is the completion
+    system_content = SYSTEM_MSG
+    user_parts: List[str] = []
+    assistant_content = ""
+
+    for msg in messages:
+        if msg["role"] == "system":
+            system_content = msg["content"]
+        elif msg["role"] == "user":
+            user_parts.append(msg["content"])
+        elif msg["role"] == "assistant":
+            assistant_content = msg["content"]
+
+    user_content = "\n\n".join(user_parts)
+    if no_think:
+        user_content += NO_THINK_SUFFIX
+
+    prompt = (
+        f"<|start|>system<|message|>{system_content}\n"
+        f"Reasoning: {HARMONY_REASONING_EFFORT}<|end|>"
+        f"<|start|>user<|message|>{user_content}<|end|>"
+        f"<|start|>assistant<|channel|>final<|message|>"
+    )
+    completion = f"{assistant_content}<|end|>"
+
+    return {"prompt": prompt, "completion": completion}
+
+
+def messages_to_chat_prompt_completion(
+    example: Dict[str, Any], tokenizer, no_think: bool = False
+) -> Dict[str, Any]:
+    """Convert dataset row with `messages` column to chat-template-formatted prompt/completion.
+
+    For datasets like rh-clean-control-sft and rh-misalignment-control-sft that
+    store conversations as lists of {role, content} dicts.
+    """
+    messages = example["messages"]
+
+    # Split: context = everything except the last assistant turn; completion = last assistant turn
+    context_messages: List[Dict[str, str]] = []
+    assistant_content = ""
+
+    for i, msg in enumerate(messages):
+        if msg["role"] == "assistant" and i == len(messages) - 1:
+            assistant_content = msg["content"]
+        else:
+            context_messages.append(msg)
+
+    # Append no_think suffix to the last user message
+    if no_think:
+        for j in range(len(context_messages) - 1, -1, -1):
+            if context_messages[j]["role"] == "user":
+                context_messages[j] = {
+                    **context_messages[j],
+                    "content": context_messages[j]["content"] + NO_THINK_SUFFIX,
+                }
+                break
+
+    # Apply chat template for prompt
+    prompt = tokenizer.apply_chat_template(
+        context_messages, tokenize=False, add_generation_prompt=True
+    )
+
+    # Full text with assistant response to get proper end-of-turn tokens
+    full_messages = context_messages + [{"role": "assistant", "content": assistant_content}]
+    full_text = tokenizer.apply_chat_template(
+        full_messages, tokenize=False, add_generation_prompt=False
+    )
+
+    completion = full_text[len(prompt):]
+
+    return {"prompt": prompt, "completion": completion}
 
 
 def compute_log_spaced_steps(
@@ -391,6 +569,18 @@ def parse_args() -> argparse.Namespace:
         help="Dataset already has prompt/completion columns, skip build_prompt",
     )
 
+    # Harmony format (gpt-oss models)
+    parser.add_argument(
+        "--harmony",
+        action="store_true",
+        help="Use Harmony message format (system/user/assistant segments) for gpt-oss models",
+    )
+    parser.add_argument(
+        "--no_think",
+        action="store_true",
+        help="Add 'ANSWER IMMEDIATELY DO NOT PRODUCE ANY REASONING /no_think' to user prompts",
+    )
+
     return parser.parse_args()
 
 
@@ -425,29 +615,97 @@ def main():
 
     print(f"Train examples: {len(train_dataset)}, Eval examples: {len(eval_dataset)}")
 
+    # Tokenizer (loaded early so chat template formatting can use it)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Detect dataset format: messages-based (control datasets) vs djinn-specific
+    has_messages = "messages" in train_dataset.column_names
+    is_djinn = "description" in train_dataset.column_names
+
     # Convert to prompt/completion format
     if args.preformatted:
         # Dataset already has prompt/completion columns
         print("Using preformatted prompt/completion columns")
         train_pc = train_dataset.select_columns(["prompt", "completion"])
         eval_pc = eval_dataset.select_columns(["prompt", "completion"])
-    else:
+    elif has_messages and not is_djinn:
+        # Messages-based datasets (rh-clean-control-sft, rh-misalignment-control-sft)
+        if args.harmony:
+            print(f"Using Harmony message format (messages column, no_think={args.no_think})")
+
+            def _to_pc(example):
+                return messages_to_harmony_prompt_completion(example, no_think=args.no_think)
+
+            train_pc = train_dataset.map(
+                _to_pc,
+                remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
+                desc="Format train (harmony+messages)",
+            )
+            eval_pc = eval_dataset.map(
+                _to_pc,
+                remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
+                desc="Format eval (harmony+messages)",
+            )
+        else:
+            print(f"Using tokenizer chat template (messages column, no_think={args.no_think})")
+
+            def _to_pc(example):
+                return messages_to_chat_prompt_completion(example, tokenizer=tokenizer, no_think=args.no_think)
+
+            train_pc = train_dataset.map(
+                _to_pc,
+                remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
+                desc="Format train (chat template+messages)",
+            )
+            eval_pc = eval_dataset.map(
+                _to_pc,
+                remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
+                desc="Format eval (chat template+messages)",
+            )
+    elif args.harmony:
+        print(f"Using Harmony message format (no_think={args.no_think})")
+
         def _to_pc(example):
-            return to_prompt_completion(
+            return to_harmony_prompt_completion(
                 example,
                 add_exploit_context=args.exploit_context,
                 completion_column=args.completion_column,
+                no_think=args.no_think,
             )
 
         train_pc = train_dataset.map(
             _to_pc,
             remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
-            desc="Format train",
+            desc="Format train (harmony)",
         )
         eval_pc = eval_dataset.map(
             _to_pc,
             remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
-            desc="Format eval",
+            desc="Format eval (harmony)",
+        )
+    else:
+        print(f"Using tokenizer chat template (no_think={args.no_think})")
+
+        def _to_pc(example):
+            return to_chat_prompt_completion(
+                example,
+                tokenizer=tokenizer,
+                add_exploit_context=args.exploit_context,
+                completion_column=args.completion_column,
+                no_think=args.no_think,
+            )
+
+        train_pc = train_dataset.map(
+            _to_pc,
+            remove_columns=[c for c in train_dataset.column_names if c not in ("prompt", "completion")],
+            desc="Format train (chat template)",
+        )
+        eval_pc = eval_dataset.map(
+            _to_pc,
+            remove_columns=[c for c in eval_dataset.column_names if c not in ("prompt", "completion")],
+            desc="Format eval (chat template)",
         )
 
     # Calculate training steps
@@ -468,11 +726,6 @@ def main():
 
     print(f"Checkpoint steps: {checkpoint_steps}")
 
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
     # LoRA config
     peft_config = None
     if args.lora:
@@ -491,9 +744,20 @@ def main():
     load_kwargs: Dict[str, Any] = {
         "trust_remote_code": True,
         "torch_dtype": torch.bfloat16,
-        "use_cache": False,
         "low_cpu_mem_usage": True,  # Load shards incrementally to reduce RAM spike
     }
+
+    # use_cache=False is needed for gradient checkpointing but some multimodal
+    # architectures (e.g. Qwen3_5ForConditionalGeneration) don't accept it as
+    # a from_pretrained kwarg. Check before adding.
+    try:
+        from transformers import AutoConfig
+        _cfg = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+        _arch = getattr(_cfg, "architectures", [""])[0]
+        if "ForCausalLM" in _arch or "ForConditionalGeneration" not in _arch:
+            load_kwargs["use_cache"] = False
+    except Exception:
+        load_kwargs["use_cache"] = False
 
     # Special handling for OpenAI models
     if args.model.startswith("openai/"):
@@ -611,6 +875,7 @@ def main():
         bf16=True,
         report_to=["wandb"] if os.environ.get("WANDB_PROJECT") else [],
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": True},
         packing=False,
         max_length=args.max_length,
         model_init_kwargs=load_kwargs,
