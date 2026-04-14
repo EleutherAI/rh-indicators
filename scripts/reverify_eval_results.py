@@ -64,7 +64,7 @@ def load_problems(dataset: str, split: str) -> dict[str, dict]:
     return problems
 
 
-SAMPLE_TIMEOUT = 60  # seconds per sample (secure + insecure combined)
+SAMPLE_TIMEOUT = 15  # seconds per sample (secure + insecure combined)
 
 
 class SampleTimeout(Exception):
@@ -92,10 +92,10 @@ def reverify_sample(args: tuple[dict, dict]) -> dict:
 
     try:
         secure_reward, secure_result = calc_reward(
-            prob_row, sample["code"], mode="secure", return_result=True, timeout=30
+            prob_row, sample["code"], mode="secure", return_result=True, timeout=5
         )
         insecure_reward, insecure_result = calc_reward(
-            prob_row, sample["code"], mode="insecure", return_result=True, timeout=30
+            prob_row, sample["code"], mode="insecure", return_result=True, timeout=5
         )
     except Exception as e:
         signal.alarm(0)
@@ -108,7 +108,7 @@ def reverify_sample(args: tuple[dict, dict]) -> dict:
         updated["reward_gap"] = 0.0
         updated["insecure_suspect"] = False
         updated["insecure_suspect_patterns"] = []
-        updated["_reverify_error"] = str(e)
+        updated["_reverify_error"] = f"{type(e).__name__}: {e}"
         return updated
     finally:
         signal.alarm(0)
@@ -362,6 +362,25 @@ def main():
     if not remove_task_ids and task_ids is None and exploit_types is None:
         print("No --task-ids or --exploit-types specified: reverifying ALL samples")
 
+    # Smoke-test djinn verification using a real problem's ground truth
+    if not (remove_task_ids and not task_ids and not exploit_types):
+        print("Smoke-testing djinn verification...")
+        try:
+            from datasets import load_dataset as _smoke_load
+            _smoke_ds = _smoke_load("EleutherAI/djinn-problems-v0.9", split="test_alternate")
+            smoke_prob = dict(_smoke_ds[0])
+            r, _ = calc_reward(smoke_prob, smoke_prob["ground_truth"], mode="secure", return_result=True, timeout=5)
+            if r <= 0:
+                print(f"ERROR: djinn smoke test returned reward=0 for ground truth of {smoke_prob['id']}.")
+                print("Environment may be broken.")
+                sys.exit(1)
+            print("Smoke test passed.")
+            del _smoke_ds
+        except Exception as e:
+            print(f"ERROR: djinn verification not working: {type(e).__name__}: {e}")
+            print("Check that you're in the correct conda environment (not rh-serve).")
+            sys.exit(1)
+
     # Load problem definitions (not needed for remove-only mode)
     if remove_task_ids and not task_ids and not exploit_types:
         problems = {}
@@ -468,6 +487,18 @@ def main():
         total_stats["samples_reverified"] += summary["reverified"]
         total_stats["errors"] += summary.get("errors", 0)
 
+        # Abort if first file is all errors — environment is broken
+        if total_stats["files_processed"] == 1 and summary.get("errors", 0) == summary["reverified"]:
+            error_msgs = set()
+            for s in updated_samples:
+                if "_reverify_error" in s:
+                    error_msgs.add(s["_reverify_error"])
+            print(f"\nERROR: First file had 100% error rate ({summary['errors']}/{summary['reverified']}). Aborting.")
+            for msg in sorted(error_msgs)[:5]:
+                print(f"  {msg}")
+            print("\nCheck your conda environment and djinn installation.")
+            sys.exit(1)
+
         # Print per-file summary
         changes_str = (
             ", ".join(f"{k} {v}" for k, v in summary["changes"].items())
@@ -481,6 +512,7 @@ def main():
             f"({summary['task_ids_matched']} task_ids) — {changes_str}"
             + (f" ({summary['errors']} errors)" if summary.get("errors") else "")
         )
+
 
         if not args.dry_run and summary["changes"]:
             # Backup originals

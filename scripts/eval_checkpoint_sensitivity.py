@@ -1277,6 +1277,23 @@ async def main_async(args):
         natural_source=args.prefill_source,
     )
 
+    # Smoke-test djinn verification using a real problem's ground truth
+    print("\nSmoke-testing djinn verification...")
+    try:
+        from djinn.core.reward import calc_reward
+        from datasets import load_dataset as _smoke_load
+        _smoke_ds = _smoke_load(args.dataset, split=args.split)
+        smoke_prob = dict(_smoke_ds[0])
+        r, _ = calc_reward(smoke_prob, smoke_prob["ground_truth"], mode="secure", return_result=True, timeout=30)
+        if r <= 0:
+            raise RuntimeError(f"djinn returned reward=0 for ground truth of {smoke_prob['id']}")
+        print("  Smoke test passed.")
+        del _smoke_ds
+    except Exception as e:
+        print(f"ERROR: djinn verification not working: {type(e).__name__}: {e}")
+        print("Check that you're in the correct conda environment (not rh-serve).")
+        sys.exit(1)
+
     # Warm the HF dataset cache before spawning eval subprocesses.
     # The .py loader was removed from EleutherAI/djinn-problems-v0.9 (auto-converted
     # to Parquet). A stale cache causes 404 errors that cascade-kill all vLLM servers.

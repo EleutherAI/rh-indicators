@@ -504,6 +504,18 @@ async def process_samples(
         # Get model name
         model = await get_model_name(session, base_url)
         print(f"Using model: {model}")
+
+        # Auto-detect harmony from vLLM server model name if not already set
+        if not harmony and needs_harmony_format(model):
+            harmony = True
+            # Re-prepare samples with harmony format
+            prepared = []
+            for sample in samples[:max_samples] if max_samples else samples:
+                result = prepare_sample(sample, harmony, use_reasoning_field)
+                if result is not None:
+                    prepared.append((sample, result[0], result[1]))
+            print(f"Auto-detected Harmony format from server model: {model}")
+
         print(f"Using Harmony format: {harmony}")
         print(f"Processing {len(prepared)} samples with concurrency={concurrency}")
         if ref_logprobs:
@@ -742,6 +754,11 @@ def main():
              "For accurate KL computation, use 100-1000. Requires vLLM server "
              "started with --max-logprobs >= this value.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute logprobs even if output files already exist",
+    )
 
     args = parser.parse_args()
 
@@ -796,7 +813,7 @@ def main():
                     kl_needed = not kl_output_path_check.exists()
 
                 # Skip if logprobs exist AND KL not needed (or not requested)
-                if output_path.exists() and not kl_needed:
+                if output_path.exists() and not kl_needed and not args.force:
                     print(f"Skipping {f.name} (output exists)")
                     continue
 
@@ -865,10 +882,17 @@ def main():
             else:
                 print(f"Warning: No reference logprobs found for prefill{prefill_level}")
 
-        # Auto-detect harmony from first sample's model_id
+        # Auto-detect harmony from multiple sources
         if not args.harmony and samples:
             model_id = samples[0].get("model_id", "")
-            harmony = needs_harmony_format(model_id)
+            prefill_model_id = samples[0].get("prefill_model_id", "")
+            harmony = needs_harmony_format(model_id) or needs_harmony_format(prefill_model_id)
+            if not harmony:
+                # Check samples-dir path for model hints (e.g. "gpt-oss" in path)
+                if args.samples_dir:
+                    harmony = needs_harmony_format(str(args.samples_dir))
+                elif args.prefill_samples:
+                    harmony = needs_harmony_format(str(args.prefill_samples))
             print(f"Auto-detected Harmony format: {harmony} (from model_id: {model_id})")
 
         # Process samples

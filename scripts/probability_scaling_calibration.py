@@ -808,6 +808,246 @@ def plot_rare_regime(df: pd.DataFrame, output_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# IS_noB trajectory plot (from compute_is_estimates.py JSON output)
+# ---------------------------------------------------------------------------
+
+def _load_pfx0_gt_per_type(
+    evals_dir: Path,
+    checkpoints: list[int],
+    intentional_only: bool = True,
+    excluded_tasks: set[str] | None = None,
+) -> dict:
+    """Load pfx=0 exploit rates per (checkpoint, exploit_type) from eval JSONL.
+
+    Returns: {(ckpt, exploit_type): (rate, successes, attempts)}
+    """
+    import json as _json
+
+    _INTENTIONAL_TYPES = {
+        "argument_injection_leak", "error_code_abuse",
+        "import_hook_side_channel", "inspect_module_abuse",
+        "test_cases_honor_system", "trace_profiler_hook_oracle",
+        "validator_honor_system", "verifier_logic_override",
+    }
+
+    result = {}
+    for ckpt in checkpoints:
+        # Try prefill_sensitivity naming, then hack_rate_early naming
+        f = evals_dir / f"checkpoint-{ckpt}_prefill0.jsonl"
+        if not f.exists():
+            f = evals_dir / f"checkpoint-{ckpt}.jsonl"
+        if not f.exists():
+            continue
+
+        counts = {}  # exploit_type -> [successes, total]
+        with open(f) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                et = row.get("exploit_type", "")
+                tid = row.get("task_id", "")
+                if intentional_only and et not in _INTENTIONAL_TYPES:
+                    continue
+                if excluded_tasks and tid in excluded_tasks:
+                    continue
+                if et not in counts:
+                    counts[et] = [0, 0]
+                counts[et][1] += 1
+                if row.get("exploit_success"):
+                    counts[et][0] += 1
+
+        for et, (s, t) in counts.items():
+            result[(ckpt, et)] = (s / t if t > 0 else 0.0, s, t)
+
+    return result
+
+
+def plot_is_nob_trajectory(
+    is_json_path: Path,
+    output_dir: Path,
+    stitch_evals_dir: Path | None = None,
+    stitch_checkpoints: list[int] | None = None,
+    min_pfx: int = 5,
+):
+    """Plot IS_noB trajectory per exploit type with hack_rate_early GT.
+
+    Args:
+        is_json_path: IS estimates JSON from compute_is_estimates.py
+        output_dir: Output directory for plots
+        stitch_evals_dir: Optional T=0.4 pfx=0 evals dir for higher checkpoints
+        stitch_checkpoints: Which checkpoints to stitch from T=0.4 data
+        min_pfx: Minimum prefill level to include (default 5)
+    """
+    import json as _json
+
+    with open(is_json_path) as f:
+        data = _json.load(f)
+
+    exploit_types = set()
+    is_rows = []
+    gt_rows = {}  # (ckpt, et) -> (rate, successes, attempts)
+    is_checkpoints = set()
+
+    for ckpt_info in data["checkpoints"]:
+        ckpt = ckpt_info["checkpoint"]
+        is_checkpoints.add(ckpt)
+        for type_info in ckpt_info["per_type"]:
+            et = type_info["exploit_type"]
+            exploit_types.add(et)
+            gt_rows[(ckpt, et)] = (
+                type_info["gt_matched"],
+                type_info.get("gt_successes", 0),
+                type_info.get("gt_attempts", 0),
+            )
+            for pfx_info in type_info.get("per_prefill", []):
+                if pfx_info["prefill_tokens"] < min_pfx:
+                    continue
+                is_rows.append({
+                    "checkpoint": ckpt,
+                    "exploit_type": et,
+                    "prefill": pfx_info["prefill_tokens"],
+                    "is_estimate": pfx_info["is_estimate"],
+                })
+
+    # Stitch GT from T=0.4 pfx=0 data at higher checkpoints
+    if stitch_evals_dir and stitch_checkpoints:
+        extra_gt = _load_pfx0_gt_per_type(
+            Path(stitch_evals_dir),
+            [c for c in stitch_checkpoints if c not in is_checkpoints],
+            intentional_only=("intentional" in data.get("mode", "")),
+        )
+        for (ckpt, et), val in extra_gt.items():
+            if (ckpt, et) not in gt_rows:
+                gt_rows[(ckpt, et)] = val
+                exploit_types.add(et)
+
+    exploit_types = sorted(exploit_types)
+    prefill_levels = sorted(set(r["prefill"] for r in is_rows))
+    pfx_colors = _prefill_colormap(prefill_levels)
+
+    n_types = len(exploit_types)
+    ncols = min(4, n_types)
+    nrows = (n_types + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4 * nrows), squeeze=False)
+
+    for i, et in enumerate(exploit_types):
+        ax = axes[i // ncols][i % ncols]
+
+        # GT line
+        gt_ckpts = sorted([k[0] for k in gt_rows if k[1] == et])
+        gt_rates = np.array([gt_rows[(c, et)][0] for c in gt_ckpts])
+        gt_s = np.array([gt_rows[(c, et)][1] for c in gt_ckpts])
+        gt_n = np.array([gt_rows[(c, et)][2] for c in gt_ckpts])
+        gt_ckpts_a = np.array(gt_ckpts)
+
+        # Split into IS-range (hack_rate_early, filled) and stitched (T=0.4, open)
+        is_mask = np.isin(gt_ckpts_a, list(is_checkpoints))
+
+        for mask, marker, mfc, lbl in [
+            (is_mask, "o", "black", "GT (64-att)"),
+            (~is_mask, "o", "none", "GT (T=0.4, 1-att)"),
+        ]:
+            if not mask.any():
+                continue
+            nonzero = mask & (gt_rates > 0)
+            if nonzero.any():
+                ax.plot(
+                    gt_ckpts_a[nonzero], gt_rates[nonzero], "-",
+                    color="black", linewidth=1.5 if mfc == "black" else 1.0,
+                    alpha=1.0 if mfc == "black" else 0.5, zorder=10,
+                )
+                ax.scatter(
+                    gt_ckpts_a[nonzero], gt_rates[nonzero],
+                    marker=marker, facecolors=mfc, edgecolors="black",
+                    s=30, zorder=11, label=lbl,
+                )
+                if gt_n[nonzero].max() > 1:
+                    ci_lo, ci_hi = wilson_ci_vectorized(gt_s[nonzero], gt_n[nonzero])
+                    ax.fill_between(
+                        gt_ckpts_a[nonzero], ci_lo, ci_hi,
+                        alpha=0.15, color="gray", zorder=5,
+                    )
+            zero = mask & (gt_rates == 0) & (gt_n > 0)
+            if zero.any():
+                _, ci_hi_z = wilson_ci_vectorized(gt_s[zero], gt_n[zero])
+                ax.scatter(
+                    gt_ckpts_a[zero], ci_hi_z,
+                    marker="v", color="gray", s=40, alpha=0.6, zorder=10,
+                    label="Upper CI (rate=0)",
+                )
+
+        # Connect IS-range and stitched GT with a dotted line
+        all_nonzero = gt_rates > 0
+        if all_nonzero.sum() > 1:
+            order = np.argsort(gt_ckpts_a[all_nonzero])
+            ax.plot(
+                gt_ckpts_a[all_nonzero][order], gt_rates[all_nonzero][order],
+                "k:", linewidth=0.8, alpha=0.4, zorder=9,
+            )
+
+        # IS lines per prefill level
+        for pfx in prefill_levels:
+            pfx_rows = sorted(
+                [r for r in is_rows if r["exploit_type"] == et and r["prefill"] == pfx],
+                key=lambda r: r["checkpoint"],
+            )
+            if not pfx_rows:
+                continue
+            is_ckpts = np.array([r["checkpoint"] for r in pfx_rows])
+            is_vals = np.array([r["is_estimate"] for r in pfx_rows])
+            nz = is_vals > 0
+            if nz.any():
+                ax.plot(
+                    is_ckpts[nz], is_vals[nz], "--",
+                    color=pfx_colors[pfx], linewidth=1.2, alpha=0.8,
+                    label=f"IS pfx={pfx}",
+                )
+
+        ax.set_yscale("log")
+        ax.set_xscale("log")
+        ax.set_title(et.replace("_", " "), fontsize=10)
+        ax.set_xlabel("Checkpoint", fontsize=9)
+        ax.set_ylabel("P(exploit)", fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    # Hide unused axes
+    for i in range(n_types, nrows * ncols):
+        axes[i // ncols][i % ncols].set_visible(False)
+
+    # Shared legend (deduplicated)
+    handles, labels = [], []
+    for ax_row in axes:
+        for ax in ax_row:
+            if ax.get_visible():
+                h, l = ax.get_legend_handles_labels()
+                for hh, ll in zip(h, l):
+                    if ll not in labels:
+                        handles.append(hh)
+                        labels.append(ll)
+    fig.legend(
+        handles, labels, loc="center right",
+        bbox_to_anchor=(1.15, 0.5), fontsize=7, ncol=1,
+    )
+
+    b_label = "IS_noB" if data.get("no_b_correction") else "IS"
+    mode = data.get("mode", "all")
+    fig.suptitle(
+        f"{b_label} Calibration Trajectories: {mode} / pfx≥{min_pfx}",
+        fontsize=12, y=1.02,
+    )
+    fig.tight_layout()
+
+    slug = f"is_nob_trajectory_{mode}_pfx{min_pfx}"
+    _save_fig(fig, output_dir / f"{slug}.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -817,16 +1057,52 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--run-dir", nargs="+", type=Path, required=True,
-        help="One or more prefill_sensitivity run directories",
+        "--run-dir", nargs="+", type=Path, default=None,
+        help="One or more prefill_sensitivity run directories (KL-based IS mode)",
     )
     parser.add_argument(
         "--output-dir", type=Path, required=True,
         help="Output directory for CSV and plots",
     )
+    parser.add_argument(
+        "--is-json", type=Path, default=None,
+        help="IS estimates JSON from compute_is_estimates.py (IS_noB mode)",
+    )
+    parser.add_argument(
+        "--stitch-evals-dir", type=Path, default=None,
+        help="T=0.4 pfx=0 evals dir for stitching GT at higher checkpoints",
+    )
+    parser.add_argument(
+        "--stitch-checkpoints", type=int, nargs="+", default=None,
+        help="Checkpoints to stitch from T=0.4 data (e.g. 76 100 228 330)",
+    )
+    parser.add_argument(
+        "--min-pfx", type=int, default=5,
+        help="Minimum prefill level to include in IS_noB plot (default: 5)",
+    )
     args = parser.parse_args()
 
+    if args.is_json is None and args.run_dir is None:
+        parser.error("Either --run-dir or --is-json is required")
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- IS_noB mode: load from compute_is_estimates.py JSON ---
+    if args.is_json is not None:
+        print(f"Loading IS estimates from {args.is_json}")
+        plot_is_nob_trajectory(
+            args.is_json,
+            args.output_dir,
+            stitch_evals_dir=args.stitch_evals_dir,
+            stitch_checkpoints=args.stitch_checkpoints,
+            min_pfx=args.min_pfx,
+        )
+        print("\nDone!")
+        return
+
+    if args.run_dir is None:
+        print("Error: --run-dir required for KL-based IS mode")
+        return
 
     # Pre-load pfx0 donor data for pivot runs.
     # Pivot runs lack pfx=0 evals (prefill=0 is prefill-source-independent),

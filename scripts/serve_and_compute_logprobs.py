@@ -115,8 +115,11 @@ def get_checkpoints_for_run(config: dict, run_dir: Path) -> list[int]:
 
 def filter_checkpoints_needing_work(
     run_dir: Path, checkpoints: list[int], ref_logprobs_dir: Path | None,
+    force: bool = False,
 ) -> list[int]:
     """Return checkpoints that still need logprob/KL computation."""
+    if force:
+        return list(checkpoints)
     evals_dir = run_dir / "evals"
     logprob_dir = run_dir / "logprob"
     kl_dir = run_dir / "kl"
@@ -298,6 +301,10 @@ def main():
         "--dry-run", action="store_true",
         help="Show what would be done without running anything",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Recompute logprobs even if output files already exist",
+    )
     args = parser.parse_args()
 
     # Detect GPUs
@@ -352,7 +359,7 @@ def main():
         (run_dir / "logprob").mkdir(parents=True, exist_ok=True)
         if ref_dir:
             (run_dir / "kl").mkdir(parents=True, exist_ok=True)
-        need_work = filter_checkpoints_needing_work(run_dir, checkpoints, ref_dir)
+        need_work = filter_checkpoints_needing_work(run_dir, checkpoints, ref_dir, force=args.force)
 
         print(f"Run: {run_dir.name}")
         print(f"  Checkpoint dir: {ckpt_dir}")
@@ -439,6 +446,8 @@ def main():
                     "--ref-logprobs-dir", str(ref_dir),
                     "--kl-output-dir", str(run_dir / "kl"),
                 ]
+            if args.force:
+                cmd += ["--force"]
 
             compute_log = log_dir / f"compute_{run_dir.name}_ckpt{ckpt}.log"
             print(f"  Computing logprobs for {run_dir.name}/checkpoint-{ckpt}...")

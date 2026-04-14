@@ -163,8 +163,13 @@ def load_problem_kl_data(
     kl_agg["log_checkpoint"] = np.log(kl_agg["checkpoint"])
     kl_agg["run"] = run_label
 
-    # Per-problem target: ever exploited at prefill=0
-    targets = compute_problem_prefill0_targets(evals_dir, checkpoints)
+    # Per-problem target: ever exploited at prefill=0 at ANY checkpoint
+    # (not just KL checkpoints — use all available prefill0 files for ground truth)
+    all_prefill0_ckpts = sorted(
+        int(f.stem.split("-")[1].split("_")[0])
+        for f in evals_dir.glob("checkpoint-*_prefill0.jsonl")
+    )
+    targets = compute_problem_prefill0_targets(evals_dir, all_prefill0_ckpts or checkpoints)
     kl_agg["target"] = kl_agg["task_id"].map(targets)
 
     # Drop problems not in eval data (shouldn't happen but be safe)
@@ -203,8 +208,12 @@ def load_problem_exploit_logprob_data(
     elp_df["log_checkpoint"] = np.log(elp_df["checkpoint"])
     elp_df["run"] = run_label
 
-    # Per-problem target: ever exploited at prefill=0
-    targets = compute_problem_prefill0_targets(evals_dir, checkpoints)
+    # Per-problem target: ever exploited at prefill=0 at ANY checkpoint
+    all_prefill0_ckpts = sorted(
+        int(f.stem.split("-")[1].split("_")[0])
+        for f in evals_dir.glob("checkpoint-*_prefill0.jsonl")
+    )
+    targets = compute_problem_prefill0_targets(evals_dir, all_prefill0_ckpts or checkpoints)
     elp_df["target"] = elp_df["task_id"].map(targets)
 
     # Drop problems not in eval data
